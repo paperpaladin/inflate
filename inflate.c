@@ -255,31 +255,65 @@ static uint32_t le32(const uint8_t *p) {
  * concatenated-member streams `cat a.gz b.gz` produces, because gzip -d does. */
 static const char *gunzip(const uint8_t *p, size_t n, Buf *o) {
 	Br b = {p, n, 0, 0, 0};
+	int members = 0;
 
-	/* Shortest legal member is 10 header + 1 deflate byte + 8 footer. */
-	if (!n) return "not gzip: empty input";
-	if (n < 19) return "truncated gzip header";
-	if (b.p[0] != 0x1f || b.p[1] != 0x8b) return "not gzip: bad magic";
-	if (b.p[2] != 8) return "unsupported compression method";
-	/* shortcut: optional header fields and concatenated members come later.
-	 * Rejecting beats skipping bytes we have not learned to parse. */
-	if (b.p[3]) return "gzip header option fields not supported yet";
-	b.i = 10;
+	for (;;) {
+		if (b.i == b.n)
+			return members ? NULL : "not gzip: empty input";
+		/* Shortest legal member is 10 header + 1 deflate + 8 footer. */
+		if (b.n - b.i < 19)
+			return members ? "trailing garbage after gzip member"
+			               : "truncated gzip header";
+		if (b.p[b.i] != 0x1f || b.p[b.i + 1] != 0x8b)
+			return members ? "trailing garbage after gzip member"
+			               : "not gzip: bad magic";
+		if (b.p[b.i + 2] != 8) return "unsupported compression method";
+		uint8_t flg = b.p[b.i + 3];
+		if (flg & 0xe0) return "reserved gzip flag bits set";
+		b.i += 10;
 
-	const char *e = inflate_raw(&b, o);
-	if (e) return e;
+		if (flg & 4) { /* FEXTRA */
+			if (b.n - b.i < 2) return "truncated FEXTRA";
+			size_t xl = b.p[b.i] | (size_t)b.p[b.i + 1] << 8;
+			b.i += 2;
+			if (b.n - b.i < xl) return "truncated FEXTRA";
+			b.i += xl;
+		}
+		if (flg & 8) { /* FNAME: gzip sets this whenever it compresses a file */
+			while (b.i < b.n && b.p[b.i]) b.i++;
+			if (b.i >= b.n) return "truncated FNAME";
+			b.i++;
+		}
+		if (flg & 16) { /* FCOMMENT */
+			while (b.i < b.n && b.p[b.i]) b.i++;
+			if (b.i >= b.n) return "truncated FCOMMENT";
+			b.i++;
+		}
+		/* shortcut: FHCRC is skipped, not verified. The payload CRC-32 already
+		 * catches corruption; add the header CRC16 if a caller needs to reject
+		 * a bad header before spending time inflating. */
+		if (flg & 2) {
+			if (b.n - b.i < 2) return "truncated FHCRC";
+			b.i += 2;
+		}
 
-	/* b.i already points past the last byte the bit reader touched and the
-	 * footer is byte-aligned, so leftover bits are simply padding. */
-	b.acc = 0;
-	b.cnt = 0;
-	if (b.n - b.i < 8) return "truncated gzip footer";
-	uint32_t want = le32(b.p + b.i), isize = le32(b.p + b.i + 4);
-	b.i += 8;
-	if (crc32b(o->p, o->n) != want) return "CRC-32 mismatch";
-	if ((uint32_t)o->n != isize) return "ISIZE mismatch";
-	if (b.i != b.n) return "trailing garbage after gzip member";
-	return NULL;
+		size_t start = o->n;
+		b.acc = 0;
+		b.cnt = 0;
+		const char *e = inflate_raw(&b, o);
+		if (e) return e;
+
+		/* b.i already points past the last byte the bit reader touched, and
+		 * the footer is byte-aligned, so leftover bits are simply padding. */
+		b.acc = 0;
+		b.cnt = 0;
+		if (b.n - b.i < 8) return "truncated gzip footer";
+		uint32_t want = le32(b.p + b.i), isize = le32(b.p + b.i + 4);
+		b.i += 8;
+		if (crc32b(o->p + start, o->n - start) != want) return "CRC-32 mismatch";
+		if ((uint32_t)(o->n - start) != isize) return "ISIZE mismatch";
+		members++;
+	}
 }
 
 /* ================================================================== main */
