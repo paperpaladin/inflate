@@ -318,37 +318,166 @@ static const char *gunzip(const uint8_t *p, size_t n, Buf *o) {
 
 /* ============================================================== ENCODER */
 
-/* shortcut: stored blocks only, so this "compressor" never shrinks anything.
- * It exists first because it makes the gzip framing, the CRC-32 and ISIZE
- * testable against gzip -d before any Huffman coding is in the way. LZ77 and
- * fixed Huffman arrive next. */
+#define HBITS 15
+#define HSIZE (1u << HBITS)
+#define NIL 0xffffffffu
+#define MINM 3
+#define MAXM 258
+#define WIN 32768
+#define BLKIN 32768 /* input bytes per block; one stored block can hold 65535 */
+#define CHAIN 128   /* shortcut: one fixed chain limit, no -1..-9 levels */
+
+typedef struct { Buf *o; uint32_t acc; int nbits; } Bw;
+
+static void wbits(Bw *w, uint32_t v, int n) {
+	w->acc |= (v & ((1u << n) - 1)) << w->nbits;
+	w->nbits += n;
+	while (w->nbits >= 8) {
+		bput(w->o, w->acc & 0xff);
+		w->acc >>= 8;
+		w->nbits -= 8;
+	}
+}
+static void walign(Bw *w) {
+	if (w->nbits) { bput(w->o, w->acc & 0xff); w->acc = 0; w->nbits = 0; }
+}
+/* Huffman codes are defined MSB-first but the stream is LSB-first, so every
+ * code goes out reversed. Extra bits are not codes and go out as-is. */
+static void wcode(Bw *w, uint32_t code, int n) {
+	uint32_t r = 0;
+	for (int i = 0; i < n; i++) { r = (r << 1) | (code & 1); code >>= 1; }
+	wbits(w, r, n);
+}
+
+/* RFC 1951 3.2.6 fixed literal/length code. */
+static void wfix(Bw *w, int sym) {
+	if (sym < 144) wcode(w, 0x30u + (uint32_t)sym, 8);
+	else if (sym < 256) wcode(w, 0x190u + (uint32_t)sym - 144, 9);
+	else if (sym < 280) wcode(w, (uint32_t)sym - 256, 7);
+	else wcode(w, 0xC0u + (uint32_t)sym - 280, 8);
+}
+static int fixbits(int sym) {
+	return sym < 144 ? 8 : sym < 256 ? 9 : sym < 280 ? 7 : 8;
+}
+static int lcode(unsigned len) { int i = 28; while (lbase[i] > len) i--; return i; }
+static int dcode(unsigned d) { int i = 29; while (dbase[i] > d) i--; return i; }
+
+typedef struct { uint16_t v, dist; } Tok; /* dist==0 => v is a literal byte */
+
+static uint32_t hash3(const uint8_t *p) {
+	uint32_t k = (uint32_t)p[0] << 16 | (uint32_t)p[1] << 8 | p[2];
+	return (k * 2654435761u) >> (32 - HBITS);
+}
+
 static void deflate_gz(const uint8_t *in, size_t n, Buf *o) {
-	/* MTIME 0 and OS 255 ("unknown"): no clock is read, so the same input
-	 * always produces identical bytes, which is what lets the round-trip test
-	 * compare outputs rather than just lengths. */
+	/* MTIME 0 and OS 255 ("unknown"): no clock read, so output is
+	 * byte-for-byte reproducible, which the round-trip test depends on. */
 	static const uint8_t hdr[10] = {0x1f, 0x8b, 8, 0, 0, 0, 0, 0, 0, 255};
 	bwrite(o, hdr, 10);
 
+	uint32_t *head = malloc(HSIZE * sizeof *head);
+	/* shortcut: prev[] is one slot per input byte rather than one per window
+	 * slot, so peak memory is 4n. Switch to a 32K ring and stream the input
+	 * when a file stops fitting in RAM. */
+	uint32_t *prev = malloc((n ? n : 1) * sizeof *prev);
+	Tok *tok = malloc((BLKIN + 1) * sizeof *tok);
+	if (!head || !prev || !tok) die("out of memory");
+	for (uint32_t i = 0; i < HSIZE; i++) head[i] = NIL;
+
+	Bw w = {o, 0, 0};
 	size_t pos = 0;
+
 	do { /* do/while so a zero-byte input still emits one final empty block */
-		size_t blen = n - pos < 65535 ? n - pos : 65535;
-		unsigned final = pos + blen >= n;
-		/* A stored block is byte-aligned and nothing has been written at
-		 * sub-byte granularity, so BFINAL+BTYPE=00 is just one byte. */
-		bput(o, final);
-		unsigned L = (unsigned)blen, N = ~L & 0xffffu;
-		bput(o, L & 0xff);
-		bput(o, L >> 8);
-		bput(o, N & 0xff);
-		bput(o, N >> 8);
-		bwrite(o, in + pos, blen);
-		pos += blen;
+		size_t bstart = pos, ntok = 0;
+		long bits = 3 + 7; /* block header + end-of-block symbol */
+
+		while (pos < n && pos - bstart < BLKIN) {
+			unsigned best = 0;
+			size_t bestd = 0;
+			if (n - pos >= MINM) {
+				size_t max = n - pos < MAXM ? n - pos : MAXM;
+				uint32_t c = head[hash3(in + pos)];
+				for (int tries = CHAIN; c != NIL && tries; tries--) {
+					if (pos - c > WIN) break;
+					if (in[c + best] == in[pos + best]) { /* cheap reject */
+						unsigned k = 0;
+						while (k < max && in[c + k] == in[pos + k]) k++;
+						if (k > best) {
+							best = k;
+							bestd = pos - c;
+							if (best == max) break;
+						}
+					}
+					c = prev[c];
+				}
+			}
+			if (best < MINM) best = 0;
+
+			unsigned adv = best ? best : 1;
+			if (best) {
+				int lc = lcode(best), dc = dcode((unsigned)bestd);
+				tok[ntok].v = (uint16_t)best;
+				tok[ntok].dist = (uint16_t)bestd;
+				bits += fixbits(257 + lc) + lext[lc] + 5 + dext[dc];
+			} else {
+				tok[ntok].v = in[pos];
+				tok[ntok].dist = 0;
+				bits += fixbits(in[pos]);
+			}
+			ntok++;
+
+			/* Insert every covered position, not just block starts: a match
+			 * that skips bytes still has to leave them findable. */
+			for (unsigned k = 0; k < adv; k++) {
+				size_t p = pos + k;
+				if (n - p < MINM) break;
+				uint32_t h = hash3(in + p);
+				prev[p] = head[h];
+				head[h] = (uint32_t)p;
+			}
+			pos += adv;
+		}
+
+		size_t blen = pos - bstart;
+		long stored = 3 + 7 + 32 + 8 * (long)blen; /* 7 = worst-case padding */
+		unsigned final = pos >= n;
+
+		if (bits <= stored) {
+			wbits(&w, final, 1);
+			wbits(&w, 1, 2); /* BTYPE 01: fixed Huffman */
+			for (size_t i = 0; i < ntok; i++) {
+				if (!tok[i].dist) { wfix(&w, tok[i].v); continue; }
+				int lc = lcode(tok[i].v), dc = dcode(tok[i].dist);
+				wfix(&w, 257 + lc);
+				wbits(&w, (uint32_t)(tok[i].v - lbase[lc]), lext[lc]);
+				wcode(&w, (uint32_t)dc, 5);
+				wbits(&w, (uint32_t)(tok[i].dist - dbase[dc]), dext[dc]);
+			}
+			wfix(&w, 256);
+		} else {
+			/* Incompressible run: a stored block is 5 bytes of overhead
+			 * instead of the ~5% a Huffman pass costs on random data. */
+			wbits(&w, final, 1);
+			wbits(&w, 0, 2);
+			walign(&w);
+			unsigned L = (unsigned)blen, N = ~L & 0xffffu;
+			bput(o, L & 0xff);
+			bput(o, L >> 8);
+			bput(o, N & 0xff);
+			bput(o, N >> 8);
+			bwrite(o, in + bstart, blen);
+		}
 	} while (pos < n);
 
+	walign(&w);
 	uint32_t c = crc32b(in, n);
 	for (int i = 0; i < 4; i++) bput(o, (c >> (8 * i)) & 0xff);
 	uint32_t sz = (uint32_t)n; /* RFC 1952: input size modulo 2^32 */
 	for (int i = 0; i < 4; i++) bput(o, (sz >> (8 * i)) & 0xff);
+
+	free(head);
+	free(prev);
+	free(tok);
 }
 
 /* ================================================================== main */
