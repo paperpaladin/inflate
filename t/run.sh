@@ -67,6 +67,49 @@ gzip -9 -c -n < "$F/text" > "$D/noname.gz" \
 	&& "$IN" -d < "$D/noname.gz" > "$D/out" && cmp -s "$F/text" "$D/out"
 check "gzip -n (no FNAME)" $?
 
+# Handcrafted members exercising FEXTRA/FCOMMENT/FHCRC, which the gzip CLI
+# never emits, so nothing above reaches those header branches. The script
+# asserts gzip -d and we agree, member by member.
+python3 - "$F/text" "$IN" <<'PY' && ok || bad "FEXTRA/FCOMMENT/FHCRC headers"
+import subprocess, sys, zlib
+data = open(sys.argv[1], 'rb').read()
+B = sys.argv[2]
+raw = subprocess.run(['gzip','-9','-c','-n'], input=data,
+                     capture_output=True, check=True).stdout
+assert raw[3] == 0          # gzip -n on stdin sets no optional header fields
+body = raw[10:]
+
+def member(extra=None, name=None, comment=None, hcrc=False):
+	flg = ((4 if extra is not None else 0) | (8 if name else 0)
+	       | (16 if comment else 0) | (2 if hcrc else 0))
+	h = bytes([0x1f, 0x8b, 8, flg, 0, 0, 0, 0, 0, 255])
+	if extra is not None: h += len(extra).to_bytes(2, 'little') + extra
+	if name: h += name + b'\0'
+	if comment: h += comment + b'\0'
+	if hcrc: h += (zlib.crc32(h) & 0xffff).to_bytes(2, 'little')
+	return h + body
+
+cases = {
+	'FEXTRA':       member(extra=b'ab\x04\x00xxxx'),
+	'FEXTRA empty': member(extra=b''),
+	'FNAME':        member(name=b'some/file.txt'),
+	'FCOMMENT':     member(comment=b'a comment'),
+	'FHCRC':        member(hcrc=True),
+	'all flags':    member(extra=b'QQ\x02\x00hi', name=b'n', comment=b'c', hcrc=True),
+}
+rc = 0
+for label, m in cases.items():
+	g = subprocess.run(['gzip', '-d'], input=m, capture_output=True)
+	o = subprocess.run([B, '-d'], input=m, capture_output=True)
+	gok = g.returncode == 0 and g.stdout == data
+	ook = o.returncode == 0 and o.stdout == data
+	if gok != ook:
+		print('  %s: gzip=%s ours=%s %s'
+		      % (label, gok, ook, o.stderr.decode().strip()))
+		rc = 1
+sys.exit(rc)
+PY
+
 # --------------------------------------- 5. concatenated members, both ways
 gzip -c < "$F/one" > "$D/a.gz"
 gzip -9 -c < "$F/text" > "$D/b.gz"
