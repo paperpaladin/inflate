@@ -8,7 +8,10 @@
 IN=${1:-./inflate}
 case $IN in /*) ;; *) IN="$PWD/$IN" ;; esac
 
-D=$(dirname "$0")/tmp
+# shortcut: scratch dir is keyed on the binary name, so `make test` and
+# `make test-asan` can run concurrently, but two runs of the SAME binary
+# still clobber each other. Append $$ if that ever becomes a real workflow.
+D=$(dirname "$0")/tmp/$(basename "$IN")
 rm -rf "$D"
 mkdir -p "$D"
 F="$D/fix"
