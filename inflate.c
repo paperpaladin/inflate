@@ -30,11 +30,23 @@ static void bneed(Buf *b, size_t extra) {
 	b->p = q;
 	b->cap = c;
 }
+static void bput(Buf *b, unsigned v) { bneed(b, 1); b->p[b->n++] = (uint8_t)v; }
 static void bwrite(Buf *b, const void *s, size_t n) {
 	bneed(b, n);
 	memcpy(b->p + b->n, s, n);
 	b->n += n;
 }
+
+/* ------------------------------------------------------- RFC 1951 tables */
+
+static const uint16_t lbase[29] = {3,4,5,6,7,8,9,10,11,13,15,17,19,23,27,31,
+	35,43,51,59,67,83,99,115,131,163,195,227,258};
+static const uint8_t lext[29] = {0,0,0,0,0,0,0,0,1,1,1,1,2,2,2,2,3,3,3,3,4,4,
+	4,4,5,5,5,5,0};
+static const uint16_t dbase[30] = {1,2,3,4,5,7,9,13,17,25,33,49,65,97,129,193,
+	257,385,513,769,1025,1537,2049,3073,4097,6145,8193,12289,16385,24577};
+static const uint8_t dext[30] = {0,0,0,0,1,1,2,2,3,3,4,4,5,5,6,6,7,7,8,8,9,9,
+	10,10,11,11,12,12,13,13};
 
 /* ----------------------------------------------------------------- crc32 */
 
@@ -71,9 +83,62 @@ static int rbits(Br *b, int need, uint32_t *out) {
 	return 0;
 }
 
+/* Canonical Huffman as counts-plus-sorted-symbols. Decoding walks one bit at
+ * a time instead of using a lookup table: ~15 lines, no table build, and the
+ * oracle says it is fast enough. */
+typedef struct { uint16_t count[16]; uint16_t sym[288]; } Huf;
+
+/* Returns <0 on over-subscription, 0 complete, >0 slack (incomplete tree). */
+static int hbuild(Huf *h, const uint8_t *len, int n) {
+	memset(h->count, 0, sizeof h->count);
+	for (int i = 0; i < n; i++) h->count[len[i]]++;
+	if (h->count[0] == n) return 0; /* empty tree: legal while never used */
+	int left = 1;
+	for (int l = 1; l < 16; l++) {
+		left <<= 1;
+		left -= h->count[l];
+		if (left < 0) return -1;
+	}
+	uint16_t off[16];
+	off[1] = 0;
+	for (int l = 1; l < 15; l++) off[l + 1] = off[l] + h->count[l];
+	for (int i = 0; i < n; i++) if (len[i]) h->sym[off[len[i]]++] = (uint16_t)i;
+	return left;
+}
+
+static int hdec(Br *b, const Huf *h) {
+	int code = 0, first = 0, index = 0;
+	for (int l = 1; l < 16; l++) {
+		uint32_t bit;
+		if (rbits(b, 1, &bit)) return -1;
+		code |= (int)bit;
+		int c = h->count[l];
+		if (code - first < c) return h->sym[index + (code - first)];
+		index += c;
+		first = (first + c) << 1;
+		code <<= 1;
+	}
+	return -1; /* no code matched in 15 bits: corrupt, or an incomplete tree */
+}
+
+static Huf fixlit, fixdist;
+static void fixinit(void) {
+	uint8_t l[288];
+	for (int i = 0; i < 144; i++) l[i] = 8;
+	for (int i = 144; i < 256; i++) l[i] = 9;
+	for (int i = 256; i < 280; i++) l[i] = 7;
+	for (int i = 280; i < 288; i++) l[i] = 8;
+	hbuild(&fixlit, l, 288);
+	/* 32 codes, not 30: RFC 1951 3.2.6 defines the unused 30 and 31 so that
+	 * the tree is complete. Dropping them would make it incomplete and change
+	 * which bit patterns decode. */
+	for (int i = 0; i < 32; i++) l[i] = 5;
+	hbuild(&fixdist, l, 32);
+}
+
 /* Appends one raw DEFLATE stream to o. Returns NULL on success, else why. */
 static const char *inflate_raw(Br *b, Buf *o) {
-	uint32_t final, type;
+	uint32_t v, final, type;
 
 	for (;;) {
 		if (rbits(b, 1, &final) || rbits(b, 2, &type))
@@ -93,10 +158,39 @@ static const char *inflate_raw(Br *b, Buf *o) {
 			bwrite(o, b->p + b->i, len);
 			b->i += len;
 		} else {
-			/* shortcut: Huffman blocks land in the next commit. Stored blocks
-			 * alone are enough to put the gzip framing, the CRC-32 and ISIZE
-			 * under the oracle. */
-			return "Huffman blocks not supported yet";
+			const Huf *lt = &fixlit, *dt = &fixdist;
+
+			/* shortcut: dynamic trees next. Fixed blocks already exercise the
+			 * canonical-Huffman decoder and both extra-bit tables. */
+			if (type == 2) return "dynamic Huffman blocks not supported yet";
+
+			for (;;) {
+				int s = hdec(b, lt);
+				if (s < 0) return "bad literal/length code";
+				if (s < 256) { bput(o, (unsigned)s); continue; }
+				if (s == 256) break;
+				s -= 257;
+				if (s >= 29) return "invalid length code (286/287)";
+				if (rbits(b, lext[s], &v)) return "truncated: length extra bits";
+				unsigned length = lbase[s] + v;
+
+				int d = hdec(b, dt);
+				if (d < 0) return "bad distance code";
+				if (d >= 30) return "invalid distance code (30/31)";
+				if (rbits(b, dext[d], &v))
+					return "truncated: distance extra bits";
+				size_t dist = dbase[d] + v;
+				if (dist > o->n) return "distance reaches before output start";
+
+				bneed(o, length);
+				size_t from = o->n - dist;
+				/* Byte at a time, deliberately: dist < length is the RLE case
+				 * DEFLATE relies on, where source and destination overlap and
+				 * both memcpy and memmove give the wrong answer. */
+				for (unsigned k = 0; k < length; k++)
+					o->p[o->n + k] = o->p[from + k];
+				o->n += length;
+			}
 		}
 		if (final) return NULL;
 	}
@@ -158,6 +252,7 @@ int main(int argc, char **argv) {
 	}
 
 	crcinit();
+	fixinit();
 
 	Buf in = {0};
 	for (;;) {
