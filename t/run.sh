@@ -315,5 +315,18 @@ for m in "$D"/mut.*; do
 done
 check "300 mutated streams: no crash (saw $crashes)" $([ $crashes -eq 0 ]; echo $?)
 
+# ------------------------------------------------------- 8. ratio sanity
+# Not a correctness property, but a silent regression to "store everything"
+# would still pass every test above, and that is worth catching.
+ours=$("$IN" < "$F/text" | wc -c)
+theirs=$(gzip -6 -c < "$F/text" | wc -c)
+if [ "$ours" -lt $((theirs * 2)) ]; then ok
+else bad "ratio: ours $ours vs gzip -6 $theirs on text (want < 2x)"; fi
+raw=$(wc -c < "$F/rand")
+ours=$("$IN" < "$F/rand" | wc -c)
+# Random data must go through stored blocks: at most 0.2% overhead.
+if [ "$ours" -lt $((raw + raw / 500)) ]; then ok
+else bad "ratio: random data expanded $raw -> $ours (stored path not taken?)"; fi
+
 printf '\n%d passed, %d failed\n' "$pass" "$fail"
 [ "$fail" -eq 0 ]
