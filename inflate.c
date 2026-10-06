@@ -316,10 +316,46 @@ static const char *gunzip(const uint8_t *p, size_t n, Buf *o) {
 	}
 }
 
+/* ============================================================== ENCODER */
+
+/* shortcut: stored blocks only, so this "compressor" never shrinks anything.
+ * It exists first because it makes the gzip framing, the CRC-32 and ISIZE
+ * testable against gzip -d before any Huffman coding is in the way. LZ77 and
+ * fixed Huffman arrive next. */
+static void deflate_gz(const uint8_t *in, size_t n, Buf *o) {
+	/* MTIME 0 and OS 255 ("unknown"): no clock is read, so the same input
+	 * always produces identical bytes, which is what lets the round-trip test
+	 * compare outputs rather than just lengths. */
+	static const uint8_t hdr[10] = {0x1f, 0x8b, 8, 0, 0, 0, 0, 0, 0, 255};
+	bwrite(o, hdr, 10);
+
+	size_t pos = 0;
+	do { /* do/while so a zero-byte input still emits one final empty block */
+		size_t blen = n - pos < 65535 ? n - pos : 65535;
+		unsigned final = pos + blen >= n;
+		/* A stored block is byte-aligned and nothing has been written at
+		 * sub-byte granularity, so BFINAL+BTYPE=00 is just one byte. */
+		bput(o, final);
+		unsigned L = (unsigned)blen, N = ~L & 0xffffu;
+		bput(o, L & 0xff);
+		bput(o, L >> 8);
+		bput(o, N & 0xff);
+		bput(o, N >> 8);
+		bwrite(o, in + pos, blen);
+		pos += blen;
+	} while (pos < n);
+
+	uint32_t c = crc32b(in, n);
+	for (int i = 0; i < 4; i++) bput(o, (c >> (8 * i)) & 0xff);
+	uint32_t sz = (uint32_t)n; /* RFC 1952: input size modulo 2^32 */
+	for (int i = 0; i < 4; i++) bput(o, (sz >> (8 * i)) & 0xff);
+}
+
 /* ================================================================== main */
 
 static const char usage[] =
-	"usage: inflate -d < in.gz > out\n"
+	"usage: inflate [-d] < in > out\n"
+	"  (no flag)  compress stdin to a gzip stream on stdout\n"
 	"  -d         decompress a gzip stream from stdin to stdout\n";
 
 int main(int argc, char **argv) {
@@ -354,9 +390,7 @@ int main(int argc, char **argv) {
 		const char *e = gunzip(in.p, in.n, &out);
 		if (e) { fprintf(stderr, "inflate: %s\n", e); return 1; }
 	} else {
-		/* shortcut: the encoder lands later. Refusing beats silently copying -
-		 * a caller who forgot -d would otherwise get plain text named .gz. */
-		die("compression not implemented yet; use -d to decompress");
+		deflate_gz(in.p, in.n, &out);
 	}
 
 	if (out.n && fwrite(out.p, 1, out.n, stdout) != out.n) die("write error");
