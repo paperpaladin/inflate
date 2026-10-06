@@ -1,0 +1,5 @@
+inflate
+inflate-asan
+t/tmp/
+*.o
+*.gz
