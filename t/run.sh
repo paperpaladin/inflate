@@ -45,6 +45,14 @@ cat "$F/text" > "$F/far"; head -c 20 /dev/zero >> "$F/far"; cat "$F/text" >> "$F
 
 FIX="empty one two allsame zeros rep rand text mixed bytes far"
 
+# ------------------------------------------- 1. gzip -d accepts our output
+for f in $FIX; do
+	"$IN" < "$F/$f" > "$D/c.gz" 2>"$D/err" \
+		&& gzip -d < "$D/c.gz" > "$D/out" 2>>"$D/err" \
+		&& cmp -s "$F/$f" "$D/out"
+	check "ours -> gzip -d: $f" $?
+done
+
 # -------------------------------- 2. we decode gzip at every level -1..-9
 for f in $FIX; do
 	for L in 1 2 3 4 5 6 7 8 9; do
@@ -53,6 +61,12 @@ for f in $FIX; do
 			&& cmp -s "$F/$f" "$D/out"
 		check "gzip -$L -> ours -d: $f" $?
 	done
+done
+
+# --------------------------------------------------- 3. our own round trip
+for f in $FIX; do
+	"$IN" < "$F/$f" | "$IN" -d > "$D/out" 2>"$D/err" && cmp -s "$F/$f" "$D/out"
+	check "round trip: $f" $?
 done
 
 # ------------------------------- 4. gzip header variants we have to skip
@@ -117,6 +131,11 @@ cat "$D/a.gz" "$D/b.gz" > "$D/cat.gz"
 cat "$F/one" "$F/text" > "$D/cat.exp"
 "$IN" -d < "$D/cat.gz" > "$D/out" && cmp -s "$D/cat.exp" "$D/out"
 check "multi-member gzip stream" $?
+
+"$IN" < "$F/one" > "$D/oa.gz"; "$IN" < "$F/text" > "$D/ob.gz"
+cat "$D/oa.gz" "$D/ob.gz" | gzip -d > "$D/out" 2>/dev/null \
+	&& cmp -s "$D/cat.exp" "$D/out"
+check "gzip -d accepts our members concatenated" $?
 
 # ------------------------------------------ 6. corrupt input is rejected
 reject() { # name, file
