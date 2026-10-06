@@ -118,5 +118,36 @@ cat "$F/one" "$F/text" > "$D/cat.exp"
 "$IN" -d < "$D/cat.gz" > "$D/out" && cmp -s "$D/cat.exp" "$D/out"
 check "multi-member gzip stream" $?
 
+# ------------------------------------------ 6. corrupt input is rejected
+reject() { # name, file
+	"$IN" -d < "$2" > /dev/null 2>/dev/null
+	rc=$?
+	if [ $rc -eq 1 ]; then ok; else bad "$1 (expected exit 1, got $rc)"; fi
+}
+: > "$D/z"; reject "empty input rejected" "$D/z"
+printf 'not a gzip file at all' > "$D/z"; reject "bad magic rejected" "$D/z"
+gzip -c < "$F/text" > "$D/v.gz"
+head -c 40 "$D/v.gz" > "$D/z"; reject "truncated payload rejected" "$D/z"
+head -c 9 "$D/v.gz" > "$D/z"; reject "truncated header rejected" "$D/z"
+sz=$(wc -c < "$D/v.gz"); head -c $((sz-4)) "$D/v.gz" > "$D/z"
+reject "missing footer rejected" "$D/z"
+# Flip one bit inside the stored CRC so only the checksum disagrees.
+python3 - "$D/v.gz" "$D/z" <<'PY'
+import sys
+b = bytearray(open(sys.argv[1],'rb').read())
+b[-8] ^= 0x01
+open(sys.argv[2],'wb').write(b)
+PY
+reject "CRC-32 mismatch rejected" "$D/z"
+python3 - "$D/v.gz" "$D/z" <<'PY'
+import sys
+b = bytearray(open(sys.argv[1],'rb').read())
+b[-4] ^= 0x10          # ISIZE only
+open(sys.argv[2],'wb').write(b)
+PY
+reject "ISIZE mismatch rejected" "$D/z"
+cat "$D/v.gz" > "$D/z"; printf 'junk' >> "$D/z"
+reject "trailing garbage rejected" "$D/z"
+
 printf '\n%d passed, %d failed\n' "$pass" "$fail"
 [ "$fail" -eq 0 ]
