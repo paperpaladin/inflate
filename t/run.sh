@@ -273,5 +273,28 @@ while read -r label; do
 	i=$((i+1))
 done < "$D/evil.list"
 
+# --------------------- 7. no mutation of a valid stream may crash the decoder
+# This is the test test-asan exists for: a decompressor parses hostile bytes.
+gzip -6 -c < "$F/bytes" | head -c 3000 > "$D/seed.gz"
+python3 - "$D/seed.gz" "$D/mut" <<'PY'
+import random, sys
+random.seed(1951)
+b = open(sys.argv[1],'rb').read()
+for i in range(300):
+	m = bytearray(b)
+	for _ in range(random.randint(1,6)):
+		m[random.randrange(len(m))] = random.randrange(256)
+	open('%s.%03d' % (sys.argv[2], i),'wb').write(m)
+PY
+crashes=0
+for m in "$D"/mut.*; do
+	"$IN" -d < "$m" > /dev/null 2>/dev/null
+	rc=$?
+	# 0 (the mutation happened to stay valid) and 1 (rejected) are both fine.
+	# Anything else is a signal, i.e. a bug.
+	[ $rc -le 1 ] || { crashes=$((crashes+1)); printf '  crash rc=%s on %s\n' "$rc" "$m"; }
+done
+check "300 mutated streams: no crash (saw $crashes)" $([ $crashes -eq 0 ]; echo $?)
+
 printf '\n%d passed, %d failed\n' "$pass" "$fail"
 [ "$fail" -eq 0 ]
