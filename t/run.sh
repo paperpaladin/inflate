@@ -149,5 +149,129 @@ reject "ISIZE mismatch rejected" "$D/z"
 cat "$D/v.gz" > "$D/z"; printf 'junk' >> "$D/z"
 reject "trailing garbage rejected" "$D/z"
 
+# ------------- 6b. hand-built streams that each violate exactly one rule
+# Section 7's mutations are random, so they miss narrow checks: deleting the
+# `dist > o->n` bounds test left all 137 other assertions passing, which is how
+# this section came to exist. Each stream below breaks one rule on purpose, and
+# each assertion still belongs to the oracle - gzip -d has to reject it too, so
+# "invalid" is never just my opinion.
+python3 - "$D/evil" <<'PY'
+import sys, zlib
+out = sys.argv[1]
+
+class BW:
+	def __init__(s): s.b = bytearray(); s.a = 0; s.n = 0
+	def bits(s, v, n):
+		s.a |= (v & ((1 << n) - 1)) << s.n
+		s.n += n
+		while s.n >= 8:
+			s.b.append(s.a & 0xff); s.a >>= 8; s.n -= 8
+	def code(s, c, n):      # Huffman codes are MSB-first, the stream is LSB-first
+		r = 0
+		for _ in range(n): r = (r << 1) | (c & 1); c >>= 1
+		s.bits(r, n)
+	def align(s):
+		if s.n: s.b.append(s.a & 0xff); s.a = 0; s.n = 0
+
+def flit(w, sym):           # RFC 1951 3.2.6 fixed literal/length code
+	if sym < 144:   w.code(0x30 + sym, 8)
+	elif sym < 256: w.code(0x190 + sym - 144, 9)
+	elif sym < 280: w.code(sym - 256, 7)
+	else:           w.code(0xC0 + sym - 280, 8)
+
+def wrap(body, payload=b'A'):
+	return (bytes([0x1f, 0x8b, 8, 0, 0, 0, 0, 0, 0, 255]) + bytes(body)
+	        + zlib.crc32(payload).to_bytes(4, 'little')
+	        + len(payload).to_bytes(4, 'little'))
+
+def fixed_one_literal(w):
+	w.bits(1, 1); w.bits(1, 2)      # BFINAL, BTYPE=01 fixed
+	flit(w, 65)                     # one literal, so output length is exactly 1
+
+def dist_before_start():
+	w = BW(); fixed_one_literal(w)
+	flit(w, 257); w.code(6, 5); w.bits(1, 2)   # len 3, dist 9+1=10 > 1 byte out
+	flit(w, 256); w.align(); return w.b
+
+def bad_length_code():
+	w = BW(); fixed_one_literal(w); flit(w, 286); w.align(); return w.b
+
+def bad_dist_code():
+	w = BW(); fixed_one_literal(w)
+	flit(w, 257); w.code(30, 5)     # distance codes 30 and 31 are undefined
+	w.align(); return w.b
+
+ORD = [16,17,18,0,8,7,9,6,10,5,11,4,12,3,13,2,14,1,15]
+
+def dyn(cl, emit, hlit=257, hdist=1):
+	"""cl maps code-length symbol -> bit length; emit writes the length stream."""
+	w = BW(); w.bits(1, 1); w.bits(2, 2)       # BFINAL, BTYPE=10 dynamic
+	hclen = max(ORD.index(s) for s in cl) + 1
+	w.bits(hlit - 257, 5); w.bits(hdist - 1, 5); w.bits(hclen - 4, 4)
+	for i in range(hclen): w.bits(cl.get(ORD[i], 0), 3)
+	code = 0; prev = None; codes = {}
+	for s in sorted(cl, key=lambda s: (cl[s], s)):
+		if prev is not None: code = (code + 1) << (cl[s] - prev)
+		codes[s] = code; prev = cl[s]
+	emit(w, lambda s: w.code(codes[s], cl[s]))
+	w.align(); return w.b
+
+def oversubscribed_cl():
+	return dyn({16: 1, 17: 1, 18: 1, 0: 1}, lambda w, c: c(16))   # 4 codes of len 1
+
+def no_eob():
+	def emit(w, c):
+		c(1); c(1)                            # lens[0] = lens[1] = 1
+		c(18); w.bits(138 - 11, 7)            # 138 zeros
+		c(18); w.bits(117 - 11, 7)            # 117 more, so lens[256] stays 0
+		c(1)                                  # the single distance length
+	return dyn({18: 1, 1: 1}, emit)
+
+def repeat_overrun():
+	def emit(w, c):
+		c(1); c(1)
+		for _ in range(4): c(18); w.bits(138 - 11, 7)   # 552 lengths, alphabet is 258
+	return dyn({18: 1, 1: 1}, emit)
+
+def repeat_no_prev():
+	return dyn({16: 1, 1: 1}, lambda w, c: (c(16), w.bits(0, 2)))
+
+def stored_nlen():
+	w = BW(); w.bits(1, 1); w.bits(0, 2); w.align()
+	w.b += b'\x01\x00\xff\xff' + b'A'         # NLEN should be 0xfffe
+	return w.b
+
+def stored_truncated():
+	w = BW(); w.bits(1, 1); w.bits(0, 2); w.align()
+	w.b += (9999).to_bytes(2, 'little') + (~9999 & 0xffff).to_bytes(2, 'little') + b'A'
+	return w.b
+
+cases = [
+	('distance before output start', dist_before_start()),
+	('invalid length code 286',      bad_length_code()),
+	('invalid distance code 30',     bad_dist_code()),
+	('over-subscribed CL tree',      oversubscribed_cl()),
+	('dynamic block with no EOB',    no_eob()),
+	('code-length repeat overrun',   repeat_overrun()),
+	('repeat 16 with no previous',   repeat_no_prev()),
+	('stored LEN/NLEN mismatch',     stored_nlen()),
+	('stored block truncated',       stored_truncated()),
+]
+with open(out + '.list', 'w') as mf:
+	for i, (label, body) in enumerate(cases):
+		open('%s.%02d' % (out, i), 'wb').write(wrap(body))
+		mf.write(label + '\n')
+PY
+
+i=0
+while read -r label; do
+	f=$(printf '%s.%02d' "$D/evil" "$i")
+	gzip -d < "$f" > /dev/null 2>&1; grc=$?
+	"$IN" -d < "$f" > /dev/null 2>&1; orc=$?
+	if [ "$grc" -ne 0 ] && [ "$orc" -eq 1 ]; then ok
+	else bad "hand-built: $label (gzip rc=$grc, ours rc=$orc)"; fi
+	i=$((i+1))
+done < "$D/evil.list"
+
 printf '\n%d passed, %d failed\n' "$pass" "$fail"
 [ "$fail" -eq 0 ]
