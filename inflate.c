@@ -138,6 +138,8 @@ static void fixinit(void) {
 
 /* Appends one raw DEFLATE stream to o. Returns NULL on success, else why. */
 static const char *inflate_raw(Br *b, Buf *o) {
+	static const uint8_t ord[19] =
+		{16,17,18,0,8,7,9,6,10,5,11,4,12,3,13,2,14,1,15};
 	uint32_t v, final, type;
 
 	for (;;) {
@@ -158,11 +160,59 @@ static const char *inflate_raw(Br *b, Buf *o) {
 			bwrite(o, b->p + b->i, len);
 			b->i += len;
 		} else {
+			Huf dynl, dynd;
 			const Huf *lt = &fixlit, *dt = &fixdist;
 
-			/* shortcut: dynamic trees next. Fixed blocks already exercise the
-			 * canonical-Huffman decoder and both extra-bit tables. */
-			if (type == 2) return "dynamic Huffman blocks not supported yet";
+			if (type == 2) {
+				uint32_t hlit, hdist, hclen;
+				if (rbits(b, 5, &hlit) || rbits(b, 5, &hdist) ||
+				    rbits(b, 4, &hclen))
+					return "truncated: dynamic header";
+				hlit += 257; hdist += 1; hclen += 4;
+
+				uint8_t cl[19];
+				memset(cl, 0, sizeof cl);
+				for (uint32_t i = 0; i < hclen; i++) {
+					if (rbits(b, 3, &v)) return "truncated: code lengths";
+					cl[ord[i]] = (uint8_t)v;
+				}
+				Huf clh;
+				if (hbuild(&clh, cl, 19) < 0)
+					return "over-subscribed code-length tree";
+
+				uint8_t lens[288 + 32];
+				memset(lens, 0, sizeof lens);
+				uint32_t i = 0;
+				while (i < hlit + hdist) {
+					int s = hdec(b, &clh);
+					if (s < 0) return "bad code-length symbol";
+					if (s < 16) { lens[i++] = (uint8_t)s; continue; }
+					uint8_t val = 0;
+					uint32_t rep;
+					if (s == 16) {
+						if (i == 0) return "repeat with no previous length";
+						val = lens[i - 1];
+						if (rbits(b, 2, &rep)) return "truncated: repeat";
+						rep += 3;
+					} else if (s == 17) {
+						if (rbits(b, 3, &rep)) return "truncated: repeat";
+						rep += 3;
+					} else {
+						if (rbits(b, 7, &rep)) return "truncated: repeat";
+						rep += 11;
+					}
+					if (rep > hlit + hdist - i)
+						return "code-length repeat overruns the alphabet";
+					while (rep--) lens[i++] = val;
+				}
+				if (!lens[256]) return "no end-of-block code";
+				if (hbuild(&dynl, lens, (int)hlit) < 0)
+					return "over-subscribed literal/length tree";
+				if (hbuild(&dynd, lens + hlit, (int)hdist) < 0)
+					return "over-subscribed distance tree";
+				lt = &dynl;
+				dt = &dynd;
+			}
 
 			for (;;) {
 				int s = hdec(b, lt);
