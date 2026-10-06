@@ -13,6 +13,9 @@
 #include <stdlib.h>
 #include <string.h>
 
+/* shortcut: die() exits without freeing, so LeakSanitizer flags it. Only
+ * out-of-memory and write-error paths reach it, neither of which has a
+ * useful recovery; wire the buffers to atexit if that ever matters. */
 static void die(const char *m) { fprintf(stderr, "inflate: %s\n", m); exit(1); }
 
 /* ---------------------------------------------------------------- buffer */
@@ -515,16 +518,22 @@ int main(int argc, char **argv) {
 	Buf out = {0};
 	bneed(&out, 1); /* so out.p is never NULL and pointer arithmetic is defined */
 
+	/* Single exit, and it frees: returning straight out of the error branch
+	 * leaked both buffers on every rejected stream, and LeakSanitizer had been
+	 * reporting it unseen because its exit code is also 1. */
+	int rc = 0;
 	if (dec) {
 		const char *e = gunzip(in.p, in.n, &out);
-		if (e) { fprintf(stderr, "inflate: %s\n", e); return 1; }
+		if (e) { fprintf(stderr, "inflate: %s\n", e); rc = 1; }
 	} else {
 		deflate_gz(in.p, in.n, &out);
 	}
 
-	if (out.n && fwrite(out.p, 1, out.n, stdout) != out.n) die("write error");
-	if (fflush(stdout)) die("write error");
+	if (!rc) {
+		if (out.n && fwrite(out.p, 1, out.n, stdout) != out.n) die("write error");
+		if (fflush(stdout)) die("write error");
+	}
 	free(in.p);
 	free(out.p);
-	return 0;
+	return rc;
 }
