@@ -350,12 +350,21 @@ btype=$(python3 -c 'import sys;print((open(sys.argv[1],"rb").read(11)[10] >> 1) 
 if [ "$btype" = 2 ]; then ok
 else bad "block chooser: first block of text is BTYPE $btype, want 2 (dynamic)"; fi
 
-# These two bounds are deliberately unreachable with fixed codes, which cost
-# 1.35x on text and 2.80x on the repetitive fixture. A bound of 2x -- what this
-# was before dynamic trees existed -- passed either way and so proved nothing.
-# The slack above the measured 1.05x and 1.13x is for a future gzip that packs
-# a little tighter than this one, not for us to regress into.
-for pair in "text 120" "rep 140"; do
+# Both bounds are deliberately unreachable with the strategy one step weaker
+# than the current one, because a bound that any version would meet proves
+# nothing -- this was 2x before dynamic trees existed, which fixed codes
+# already satisfied.
+#
+# text at 100% means our output must be SMALLER than gzip -6's. Fixed codes
+# cost 1.30x and greedy matching with dynamic trees costs 1.013x, so only
+# dynamic trees plus lazy matching can pass it; measured 0.973x. It is tied to
+# this gzip's output and will need revisiting against one that packs tighter,
+# which is the price of a bound that can actually fail.
+#
+# rep at 140% is about the trees, not the matching: its matches all run to the
+# 258-byte cap, so lazy evaluation never triggers there and the measurement is
+# 1.13x either way.
+for pair in "text 100" "rep 140"; do
 	set -- $pair
 	ours=$("$IN" < "$F/$1" | wc -c)
 	theirs=$(gzip -6 -c < "$F/$1" | wc -c)

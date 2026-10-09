@@ -99,26 +99,36 @@ The encoder emits all three block types and picks per block. Measured against
 
 | input | bytes | fixed codes | own trees | `gzip -6` |
 | --- | --- | --- | --- | --- |
-| 20 copies of `inflate.c` | 513880 | 18098 (1.30x) | 14063 (1.01x) | 13880 |
+| 20 copies of `inflate.c` | 513880 | 18098 (1.30x) | **13508** (0.97x) | 13880 |
 | 30000 repeated lines | 1320000 | 10984 (2.80x) | 4440 (1.13x) | 3916 |
 | 100KB of zeros | 100000 | 656 (4.97x) | 161 (1.22x) | 132 |
 | every byte value x400 | 102400 | 1235 (1.67x) | 805 (1.09x) | 739 |
 | the deep-tree fixture | 22958 | 22978 (1.40x) | 16378 (1.00x) | 16377 |
-| 10MB of docs and man pages | 10000000 | 7887682 (1.02x) | 7738648 (1.00x) | 7731463 |
+| 10MB of docs and man pages | 10000000 | 7887682 (1.02x) | **7715731** (1.00x) | 7731463 |
 | 1.2MB of `/dev/urandom` | 1200000 | 1200203 | 1200203 | 1200203 |
 
-Encoding now costs 1.22x the time it did -- 330ms against 270ms on the 10MB
-corpus, where `gzip -6` takes 283ms. The trees themselves are close to free;
-the match search still dominates, which is why the two rows that are still
-furthest off are the two where the trees were never the problem.
+The "own trees" column also carries lazy matching, which is the other half of
+the gap and is what takes the first two rows below `gzip -6`. A greedy matcher
+takes the match in front of it; this one checks whether starting one byte later
+is strictly longer and spends the byte as a literal when it is. Worth 3.9% on
+text -- 14063 to 13508 -- and 0.3% on the 10MB corpus, and worth exactly
+nothing on the three degenerate rows, because their matches all run to the
+258-byte cap and there is no longer match to find.
+
+Encoding costs 1.50x the time it did before either change: 405ms against 270ms
+on the 10MB corpus, where `gzip -6` takes 281ms. The trees are close to free.
+Lazy matching is not, because it runs the match search twice at every position
+that found a match. Wiring `-1`..`-9` to turn it off is the next item in
+`PLAN.md`, and that measurement is why.
 
 ### What does not work
 
-- **Match finding is the remaining gap, not the coding.** One greedy pass,
-  first match wins, a fixed 128-entry chain limit, and a block boundary every
-  32KB regardless of where the symbol distribution actually turns over. That is
-  what the 1.13x on repetitive input and 1.22x on 100KB of zeros are made of:
-  the trees there are already as tight as trees can get.
+- **Match finding is still where the gap is.** One lazy pass with a one-byte
+  lookahead, a fixed 128-entry chain limit, and a block boundary every 32KB
+  regardless of where the symbol distribution actually turns over. That is what
+  the 1.13x on repetitive input and 1.22x on 100KB of zeros are made of: the
+  trees there are already as tight as trees can get, and lazy matching cannot
+  help, because every match in those already runs to the 258-byte cap.
 - **Over-long codes are corrected by halving frequencies, not by
   package-merge.** A block whose natural Huffman tree runs deeper than the 15
   bits RFC 1951 allows has every frequency halved and the tree rebuilt until it
@@ -227,6 +237,21 @@ Two more, found while adding the encoder's own Huffman trees:
   `2^l * cnt[0]`, and `wcode` only ever extracts the low `l` bits, so the
   offset always masks off. It is kept because `code[]` holding real canonical
   codes is worth one line to anyone who reads it later without knowing that.
+
+And one from the lazy matcher, which is the same shape as the 32-code case
+below: a real difference the oracle cannot resolve.
+
+- **Changing the lazy test from `next > best` to `next >= best` survives.**
+  Preferring an equal-length match one byte later pays for a literal and buys
+  nothing, so it is genuinely worse, and it costs 1.4% on the text fixture --
+  0.973x of `gzip -6` becomes 0.987x. The bound is 1.00x, so it passes.
+  Tightening to 0.98x would catch it with 0.7% of margin against *`gzip`'s*
+  output rather than against ours, so the next gzip that packs a little tighter
+  would fail this suite for a reason that has nothing to do with this code. An
+  absolute byte count would be the right assertion and is not available either:
+  the text fixture is twenty copies of `inflate.c`, so it changes size every
+  time this file does. Left as a known gap rather than papered over with a
+  brittle number.
 
 The honest summary is that the suite proves interoperability thoroughly and
 memory safety only partly.

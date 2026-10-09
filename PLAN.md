@@ -114,14 +114,26 @@ Ranked by how little control I have over them, most independent first:
       15-bit limiter left the suite green; the fixture that forces it is now
       in t/run.sh. Also found the README claiming byte-identical output to
       gzip -9 on random input, which was only ever identical in size.
-- [ ] 20 lazy match evaluation
+- [x] 20 lazy match evaluation
       why: greedy matching takes the first long match even when starting one
       byte later would be longer. Classic ~3-5% for about fifteen lines, and
       with the trees now fitted per block the match search is what the whole
       remaining gap is made of: 1.13x on repetitive input, 1.22x on zeros.
+      done: 3.9% on text, which takes it from 1.013x of gzip -6 to 0.973x --
+      smaller than gzip's own output. 0.3% on the 10MB corpus, and nothing at
+      all on the repetitive, zeros and every-byte fixtures, whose matches all
+      run to the 258-byte cap so there is no longer match to look for. Costs
+      1.18x the encode time, because the match search now runs twice at every
+      position that found one. The ratio bound on text went from 120% to 100%,
+      which is the only value that separates lazy from greedy; one mutant
+      survives (>= instead of >) and is documented in the README rather than
+      chased with a brittle bound.
 - [ ] 21 wire `-1`..`-9` to CHAIN and the lazy threshold
       why: those flags currently parse and lie. Either make them mean
-      something or remove them.
+      something or remove them. Raised in value by item 20: lazy matching
+      costs 1.18x the encode time for 3.9% on text and 0% on anything whose
+      matches saturate, so there is now a real reason to want it off, and
+      -1..-3 is where that belongs.
 - [ ] 22 choose block boundaries by cost rather than at a fixed 32KB
       why: with dynamic trees in place, a block should end where the symbol
       distribution changes, not on a round number.

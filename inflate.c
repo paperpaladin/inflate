@@ -496,6 +496,43 @@ static uint32_t hash3(const uint8_t *p) {
 	return (k * 2654435761u) >> (32 - HBITS);
 }
 
+/* Longest match for the bytes at `pos`, searching the hash chain back at most
+ * CHAIN links and WIN bytes. Returns 0 if nothing reaches MINM, otherwise the
+ * length, with the distance in *distp.
+ *
+ * It reads head[] and never writes it, which is what lets the caller run it at
+ * pos and again at pos+1 without touching the chains in between. Inserting a
+ * position before searching it would find the position itself at distance 0,
+ * and inserting one twice leaves prev[p] == p, which is a chain that never
+ * ends. */
+static unsigned match_at(const uint8_t *in, size_t n, size_t pos,
+                         const uint32_t *head, const uint32_t *prev,
+                         size_t *distp)
+{
+	unsigned best = 0;
+	size_t bestd = 0;
+
+	if (n - pos >= MINM) {
+		size_t max = n - pos < MAXM ? n - pos : MAXM;
+		uint32_t c = head[hash3(in + pos)];
+		for (int tries = CHAIN; c != NIL && tries; tries--) {
+			if (pos - c > WIN) break;
+			if (in[c + best] == in[pos + best]) { /* cheap reject */
+				unsigned k = 0;
+				while (k < max && in[c + k] == in[pos + k]) k++;
+				if (k > best) {
+					best = k;
+					bestd = pos - c;
+					if (best == max) break;
+				}
+			}
+			c = prev[c];
+		}
+	}
+	*distp = bestd;
+	return best < MINM ? 0 : best;
+}
+
 static void deflate_gz(const uint8_t *in, size_t n, Buf *o) {
 	/* MTIME 0 and OS 255 ("unknown"): no clock read, so output is
 	 * byte-for-byte reproducible, which the round-trip test depends on. */
@@ -519,26 +556,38 @@ static void deflate_gz(const uint8_t *in, size_t n, Buf *o) {
 		long bits = 3 + 7; /* block header + end-of-block symbol */
 
 		while (pos < n && pos - bstart < BLKIN) {
-			unsigned best = 0;
-			size_t bestd = 0;
-			if (n - pos >= MINM) {
-				size_t max = n - pos < MAXM ? n - pos : MAXM;
-				uint32_t c = head[hash3(in + pos)];
-				for (int tries = CHAIN; c != NIL && tries; tries--) {
-					if (pos - c > WIN) break;
-					if (in[c + best] == in[pos + best]) { /* cheap reject */
-						unsigned k = 0;
-						while (k < max && in[c + k] == in[pos + k]) k++;
-						if (k > best) {
-							best = k;
-							bestd = pos - c;
-							if (best == max) break;
-						}
+			size_t bestd;
+			unsigned best = match_at(in, n, pos, head, prev, &bestd);
+
+			/*
+			 * Lazy evaluation. A greedy matcher takes this match; starting
+			 * one byte later can give a longer one, and when it does, the
+			 * byte at pos is cheaper spent as a literal. Only a strictly
+			 * longer match justifies it -- equal length would cost the
+			 * literal for nothing.
+			 *
+			 * Nothing is inserted into the chains before the lookahead, so
+			 * the search at pos+1 cannot see pos itself. The only match that
+			 * loses is a distance-1 run, which the search at pos has already
+			 * found and which therefore wins the comparison anyway.
+			 */
+			if (best && best < MAXM && pos + 1 < n) {
+				size_t nextd;
+				unsigned next = match_at(in, n, pos + 1, head, prev, &nextd);
+				if (next > best) {
+					tok[ntok].v = in[pos];
+					tok[ntok].dist = 0;
+					bits += fixbits(in[pos]);
+					ntok++;
+					if (n - pos >= MINM) {
+						uint32_t h = hash3(in + pos);
+						prev[pos] = head[h];
+						head[h] = (uint32_t)pos;
 					}
-					c = prev[c];
+					pos++;
+					continue;
 				}
 			}
-			if (best < MINM) best = 0;
 
 			unsigned adv = best ? best : 1;
 			if (best) {
