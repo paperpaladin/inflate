@@ -371,6 +371,46 @@ for pair in "text 100" "rep 140"; do
 	if [ "$((ours * 100))" -lt "$((theirs * $2))" ]; then ok
 	else bad "ratio: ours $ours vs gzip -6 $theirs on $1 (want < $2% of it)"; fi
 done
+# -1..-9 have to mean something, and the something has to be in the right
+# direction. Four claims: gzip -d accepts every level, size never increases as
+# the level rises, -1 is strictly bigger than -9, and -6 is the default.
+#
+# The third is the one that stops this passing for nothing: before this change
+# the flags parsed and were ignored, so every level produced identical output
+# and a monotonicity check alone would have been green.
+prev=0
+lvlok=1
+for l in 1 2 3 4 5 6 7 8 9; do
+	"$IN" "-$l" < "$F/text" > "$D/l$l.gz" 2>/dev/null
+	if ! gzip -d < "$D/l$l.gz" | cmp -s - "$F/text"; then
+		bad "level -$l: gzip -d did not accept it"
+		lvlok=0
+	fi
+	n=$(wc -c < "$D/l$l.gz")
+	if [ "$prev" -ne 0 ] && [ "$n" -gt "$prev" ]; then
+		bad "level -$l grew to $n from $prev at the level below"
+		lvlok=0
+	fi
+	prev=$n
+	eval "sz$l=$n"
+done
+[ "$lvlok" = 1 ] && ok "-1..-9 all round-trip through gzip -d, sizes never grow"
+
+if [ "$sz1" -gt "$sz9" ]; then
+	ok "-9 beats -1 on text ($sz9 vs $sz1 bytes)"
+else
+	bad "-1 and -9 produced $sz1 and $sz9: the levels do nothing"
+fi
+
+# 6 is gzip's default and has to be this one too, or a drop-in caller that
+# passes no level silently gets a different strategy.
+"$IN" < "$F/text" > "$D/ldef.gz" 2>/dev/null
+if cmp -s "$D/ldef.gz" "$D/l6.gz"; then
+	ok "no level is the same as -6"
+else
+	bad "the default differs from -6 ($(wc -c < "$D/ldef.gz") vs $sz6 bytes)"
+fi
+
 raw=$(wc -c < "$F/rand")
 ours=$("$IN" < "$F/rand" | wc -c)
 # Random data must go through stored blocks: at most 0.2% overhead.

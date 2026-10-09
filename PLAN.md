@@ -128,12 +128,24 @@ Ranked by how little control I have over them, most independent first:
       which is the only value that separates lazy from greedy; one mutant
       survives (>= instead of >) and is documented in the README rather than
       chased with a brittle bound.
-- [ ] 21 wire `-1`..`-9` to CHAIN and the lazy threshold
+- [x] 21 wire `-1`..`-9` to CHAIN and the lazy threshold
       why: those flags currently parse and lie. Either make them mean
       something or remove them. Raised in value by item 20: lazy matching
       costs 1.18x the encode time for 3.9% on text and 0% on anything whose
       matches saturate, so there is now a real reason to want it off, and
       -1..-3 is where that belongs.
+      done: chain limits 4 to 1024, lazy matching off for -1..-3 and on from
+      -4 up, default 6 because that is gzip's and this is a drop-in. 26382
+      bytes at -1 to 13297 at -9 on the project's own source, against 13880
+      for gzip -6. Four assertions: gzip -d accepts all nine levels, size
+      never grows as the level rises, -1 is STRICTLY larger than -9, and no
+      level equals -6.
+      The strict comparison is the one that matters. While the flags were
+      ignored every level produced identical output, and identical output is
+      non-increasing -- so a monotonicity check on its own would have been
+      green for a program where the flags did nothing, which is exactly the
+      state this item existed to fix. Reverting the wiring now fails that one
+      assertion by name.
 - [ ] 22 choose block boundaries by cost rather than at a fixed 32KB
       why: with dynamic trees in place, a block should end where the symbol
       distribution changes, not on a round number.

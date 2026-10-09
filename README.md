@@ -12,7 +12,7 @@ rm -rf t/tmp
 gcc -std=c11 -O2 -Wall -Wextra -Wpedantic -o inflate inflate.c
 t/run.sh ./inflate
 
-159 passed, 0 failed
+162 passed, 0 failed
 ```
 
 ```
@@ -22,7 +22,7 @@ gcc -std=c11 -g -O1 -fsanitize=address,undefined -fno-omit-frame-pointer \
 ASAN_OPTIONS=exitcode=86 \
 	 UBSAN_OPTIONS=halt_on_error=1:print_stacktrace=1:exitcode=86 t/run.sh ./inflate-asan
 
-159 passed, 0 failed
+162 passed, 0 failed
 ```
 
 Usage is stdin to stdout and nothing else:
@@ -140,8 +140,16 @@ that found a match. Wiring `-1`..`-9` to turn it off is the next item in
   compressing an N-byte file costs roughly 5N plus the output. A file larger
   than RAM does not work at all. This is the limitation most likely to bite a
   real user first.
-- **No `-1`..`-9`.** Those flags parse and are then ignored, which is a small
-  lie told for drop-in convenience.
+- **`-1`..`-9` move two knobs, not three.** They set the hash-chain limit (4
+  to 1024) and whether lazy matching runs at all, which is where the time
+  goes; they do not change the block size or the Huffman strategy. `-6` is the
+  default because it is gzip's. On this project's own source they span 26382
+  bytes at `-1` to 13297 at `-9`, against 13880 for `gzip -6`.
+
+  They did nothing until recently: they parsed and were discarded. A
+  monotonicity check alone would not have caught that, since every level
+  produced identical output and identical output is non-increasing, so the
+  suite asserts `-1` is *strictly* larger than `-9`.
 - **Slower than gzip**, by about 2.3x decoding and 1.4x encoding on 10MB of
   text. The decoder walks Huffman codes one bit at a time instead of using a
   lookup table.
