@@ -51,6 +51,15 @@ static const uint16_t dbase[30] = {1,2,3,4,5,7,9,13,17,25,33,49,65,97,129,193,
 static const uint8_t dext[30] = {0,0,0,0,1,1,2,2,3,3,4,4,5,5,6,6,7,7,8,8,9,9,
 	10,10,11,11,12,12,13,13};
 
+/* RFC 1951 3.2.7: the order the code-length code lengths travel in, arranged so
+ * the ones most often nonzero come first and the tail can be dropped. The
+ * decoder reads it and the encoder writes it. */
+static const uint8_t clord[19] =
+	{16,17,18,0,8,7,9,6,10,5,11,4,12,3,13,2,14,1,15};
+
+/* Extra bits carried by code-length symbols 16, 17 and 18. */
+static int clextra(int s) { return s == 16 ? 2 : s == 17 ? 3 : s == 18 ? 7 : 0; }
+
 /* ----------------------------------------------------------------- crc32 */
 
 static uint32_t crctab[256];
@@ -141,8 +150,6 @@ static void fixinit(void) {
 
 /* Appends one raw DEFLATE stream to o. Returns NULL on success, else why. */
 static const char *inflate_raw(Br *b, Buf *o) {
-	static const uint8_t ord[19] =
-		{16,17,18,0,8,7,9,6,10,5,11,4,12,3,13,2,14,1,15};
 	uint32_t v, final, type;
 
 	for (;;) {
@@ -177,7 +184,7 @@ static const char *inflate_raw(Br *b, Buf *o) {
 				memset(cl, 0, sizeof cl);
 				for (uint32_t i = 0; i < hclen; i++) {
 					if (rbits(b, 3, &v)) return "truncated: code lengths";
-					cl[ord[i]] = (uint8_t)v;
+					cl[clord[i]] = (uint8_t)v;
 				}
 				Huf clh;
 				if (hbuild(&clh, cl, 19) < 0)
@@ -367,6 +374,123 @@ static int dcode(unsigned d) { int i = 29; while (dbase[i] > d) i--; return i; }
 
 typedef struct { uint16_t v, dist; } Tok; /* dist==0 => v is a literal byte */
 
+/* ------------------------------------------- encoder-side Huffman trees */
+
+#define NLIT 286 /* literal/length symbols we can emit: 0..285 */
+#define NDIST 30
+#define NCL 19
+#define MAXSYM 288
+
+/* One Huffman build: merge the two lightest live nodes until one is left, then
+ * read each leaf's depth off the parent chain. Returns the longest length, so
+ * the caller can tell whether the result is legal.
+ *
+ * shortcut: linear scan for the two lightest rather than a heap. n is 286 at
+ * worst and this runs three times per 32KB block -- literal/length, distance,
+ * code-length -- plus once more per halving, so the O(n^2) never reaches a
+ * profile; swap in a heap if block sizes ever grow by orders of magnitude. */
+static int huf1(const uint32_t *freq, int n, uint8_t *len) {
+	uint32_t w[2 * MAXSYM];
+	int dad[2 * MAXSYM], live[MAXSYM], nlive = 0, next = n;
+
+	for (int i = 0; i < n; i++) {
+		len[i] = 0;
+		dad[i] = -2; /* -2: unused symbol, not a leaf of this tree at all */
+		if (freq[i]) { w[i] = freq[i]; dad[i] = -1; live[nlive++] = i; }
+	}
+	/* RFC 1951 has no zero-bit code, so an alphabet used once or not at all
+	 * still needs two leaves to make a complete tree. A block of pure literals
+	 * reaches here: it carries a distance tree it never consults. */
+	for (int i = 0; i < n && nlive < 2; i++)
+		if (dad[i] == -2) { w[i] = 1; dad[i] = -1; live[nlive++] = i; }
+
+	while (nlive > 1) {
+		int a = 0, b = 1;
+		if (w[live[1]] < w[live[0]]) { a = 1; b = 0; }
+		for (int i = 2; i < nlive; i++) {
+			if (w[live[i]] < w[live[a]]) { b = a; a = i; }
+			else if (w[live[i]] < w[live[b]]) b = i;
+		}
+		int x = live[a], y = live[b];
+		w[next] = w[x] + w[y];
+		dad[x] = dad[y] = next;
+		dad[next] = -1; /* overwritten unless this turns out to be the root */
+		live[a] = next++;
+		live[b] = live[--nlive];
+	}
+
+	int longest = 0;
+	for (int i = 0; i < n; i++) {
+		if (dad[i] == -2) continue;
+		int d = 0;
+		for (int p = dad[i]; p >= 0; p = dad[p]) d++;
+		len[i] = (uint8_t)d;
+		if (d > longest) longest = d;
+	}
+	return longest;
+}
+
+/* Code lengths for freq[0..n), none longer than maxlen bits.
+ *
+ * shortcut: over-long codes are corrected by halving every frequency and
+ * rebuilding, not by package-merge. Halving strictly shrinks every weight above
+ * 1, so the loop ends at worst with a flat distribution, and 288 equally likely
+ * symbols is a 9-bit tree -- comfortably inside 15. The cost is a slightly
+ * suboptimal code on the rare block whose natural tree is deeper than the
+ * format allows. Package-merge is the upgrade if that ever shows up in a ratio
+ * measurement rather than in theory. */
+static void huflen(const uint32_t *freq, int n, int maxlen, uint8_t *len) {
+	uint32_t f[MAXSYM];
+	memcpy(f, freq, (size_t)n * sizeof *f);
+	while (huf1(f, n, len) > maxlen)
+		for (int i = 0; i < n; i++) f[i] = (f[i] + 1) / 2; /* 0 stays 0, 1 stays 1 */
+}
+
+/* Canonical codes from lengths, RFC 1951 3.2.2: shorter codes numerically
+ * first, and within one length, lower symbol numbers first. */
+static void hufcode(const uint8_t *len, int n, uint16_t *code) {
+	uint16_t cnt[16] = {0}, next[16];
+	for (int i = 0; i < n; i++) cnt[len[i]]++;
+	cnt[0] = 0; /* unused symbols get no code and must not shift the others */
+	uint16_t c = 0;
+	for (int l = 1; l < 16; l++) next[l] = c = (uint16_t)((c + cnt[l - 1]) << 1);
+	for (int i = 0; i < n; i++) if (len[i]) code[i] = next[len[i]]++;
+}
+
+/* Run-length codes the concatenated literal/length and distance lengths into
+ * the 19-symbol code-length alphabet (RFC 1951 3.2.7), writing one symbol per
+ * slot of sym[] with its extra-bit payload in extra[]. Returns how many.
+ *
+ * Repeats are allowed to cross from the last literal/length code into the first
+ * distance code; the RFC says so explicitly, and the decoder above reads both
+ * halves out of one array for exactly that reason. */
+static int clpack(const uint8_t *len, int n, uint8_t *sym, uint8_t *extra) {
+	int m = 0;
+	for (int i = 0; i < n; ) {
+		int v = len[i], run = 1;
+		while (i + run < n && len[i + run] == v) run++;
+		i += run;
+		if (v == 0) {
+			while (run >= 11) {
+				int r = run > 138 ? 138 : run;
+				sym[m] = 18; extra[m++] = (uint8_t)(r - 11); run -= r;
+			}
+			if (run >= 3) { sym[m] = 17; extra[m++] = (uint8_t)(run - 3); run = 0; }
+		} else {
+			/* Symbol 16 repeats the previous length, so the first one is
+			 * always spelled out. */
+			sym[m] = (uint8_t)v; extra[m++] = 0;
+			run--;
+			while (run >= 3) {
+				int r = run > 6 ? 6 : run;
+				sym[m] = 16; extra[m++] = (uint8_t)(r - 3); run -= r;
+			}
+		}
+		while (run-- > 0) { sym[m] = (uint8_t)v; extra[m++] = 0; }
+	}
+	return m;
+}
+
 static uint32_t hash3(const uint8_t *p) {
 	uint32_t k = (uint32_t)p[0] << 16 | (uint32_t)p[1] << 8 | p[2];
 	return (k * 2654435761u) >> (32 - HBITS);
@@ -445,7 +569,81 @@ static void deflate_gz(const uint8_t *in, size_t n, Buf *o) {
 		long stored = 3 + 7 + 32 + 8 * (long)blen; /* 7 = worst-case padding */
 		unsigned final = pos >= n;
 
-		if (bits <= stored) {
+		/* Trees fitted to this block's own symbol counts. The fixed codes are
+		 * a guess, made once in RFC 1951, about what a block looks like; on
+		 * this project's own source they cost 35% over gzip -6 and no amount
+		 * of better matching recovers it, because the frequencies never reach
+		 * a tree at all. */
+		uint32_t lfreq[NLIT] = {0}, dfreq[NDIST] = {0};
+		lfreq[256] = 1; /* end of block, emitted exactly once */
+		for (size_t i = 0; i < ntok; i++) {
+			if (!tok[i].dist) { lfreq[tok[i].v]++; continue; }
+			lfreq[257 + lcode(tok[i].v)]++;
+			dfreq[dcode(tok[i].dist)]++;
+		}
+
+		uint8_t llen[NLIT], dlen[NDIST];
+		uint16_t lcod[NLIT], dcod[NDIST];
+		huflen(lfreq, NLIT, 15, llen);
+		huflen(dfreq, NDIST, 15, dlen);
+		hufcode(llen, NLIT, lcod);
+		hufcode(dlen, NDIST, dcod);
+
+		/* Trailing unused lengths are not sent; RFC 1951 floors the counts at
+		 * 257 literal/length codes and 1 distance code. */
+		int nlit = NLIT, ndist = NDIST;
+		while (nlit > 257 && !llen[nlit - 1]) nlit--;
+		while (ndist > 1 && !dlen[ndist - 1]) ndist--;
+
+		uint8_t both[NLIT + NDIST], cls[NLIT + NDIST], clx[NLIT + NDIST];
+		memcpy(both, llen, (size_t)nlit);
+		memcpy(both + nlit, dlen, (size_t)ndist);
+		int ncls = clpack(both, nlit + ndist, cls, clx);
+
+		uint32_t cfreq[NCL] = {0};
+		for (int i = 0; i < ncls; i++) cfreq[cls[i]]++;
+		uint8_t cllen[NCL];
+		uint16_t clcod[NCL];
+		huflen(cfreq, NCL, 7, cllen); /* 3 bits each on the wire, so 7 is the cap */
+		hufcode(cllen, NCL, clcod);
+		int hclen = NCL;
+		while (hclen > 4 && !cllen[clord[hclen - 1]]) hclen--;
+
+		/* Exactly what the dynamic branch below would write, counted rather
+		 * than guessed: the trees are only worth their own header on a block
+		 * whose distribution is actually skewed. */
+		long dyn = 3 + 5 + 5 + 4 + 3 * (long)hclen + llen[256];
+		for (int i = 0; i < ncls; i++) dyn += cllen[cls[i]] + clextra(cls[i]);
+		for (size_t i = 0; i < ntok; i++) {
+			if (!tok[i].dist) { dyn += llen[tok[i].v]; continue; }
+			int lc = lcode(tok[i].v), dc = dcode(tok[i].dist);
+			dyn += llen[257 + lc] + lext[lc] + dlen[dc] + dext[dc];
+		}
+
+		if (dyn < bits && dyn < stored) {
+			wbits(&w, final, 1);
+			wbits(&w, 2, 2); /* BTYPE 10: dynamic Huffman */
+			wbits(&w, (uint32_t)(nlit - 257), 5);
+			wbits(&w, (uint32_t)(ndist - 1), 5);
+			wbits(&w, (uint32_t)(hclen - 4), 4);
+			for (int i = 0; i < hclen; i++) wbits(&w, cllen[clord[i]], 3);
+			for (int i = 0; i < ncls; i++) {
+				wcode(&w, clcod[cls[i]], cllen[cls[i]]);
+				wbits(&w, clx[i], clextra(cls[i]));
+			}
+			for (size_t i = 0; i < ntok; i++) {
+				if (!tok[i].dist) {
+					wcode(&w, lcod[tok[i].v], llen[tok[i].v]);
+					continue;
+				}
+				int lc = lcode(tok[i].v), dc = dcode(tok[i].dist);
+				wcode(&w, lcod[257 + lc], llen[257 + lc]);
+				wbits(&w, (uint32_t)(tok[i].v - lbase[lc]), lext[lc]);
+				wcode(&w, dcod[dc], dlen[dc]);
+				wbits(&w, (uint32_t)(tok[i].dist - dbase[dc]), dext[dc]);
+			}
+			wcode(&w, lcod[256], llen[256]);
+		} else if (bits <= stored) {
 			wbits(&w, final, 1);
 			wbits(&w, 1, 2); /* BTYPE 01: fixed Huffman */
 			for (size_t i = 0; i < ntok; i++) {

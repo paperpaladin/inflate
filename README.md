@@ -12,7 +12,7 @@ rm -rf t/tmp
 gcc -std=c11 -O2 -Wall -Wextra -Wpedantic -o inflate inflate.c
 t/run.sh ./inflate
 
-146 passed, 0 failed
+159 passed, 0 failed
 ```
 
 ```
@@ -22,7 +22,7 @@ gcc -std=c11 -g -O1 -fsanitize=address,undefined -fno-omit-frame-pointer \
 ASAN_OPTIONS=exitcode=86 \
 	 UBSAN_OPTIONS=halt_on_error=1:print_stacktrace=1:exitcode=86 t/run.sh ./inflate-asan
 
-146 passed, 0 failed
+159 passed, 0 failed
 ```
 
 Usage is stdin to stdout and nothing else:
@@ -84,7 +84,7 @@ hand and asserts that gzip and this code agree member by member.
 
 ## Status
 
-Works, and is verified to work by something other than itself: 146 checks pass
+Works, and is verified to work by something other than itself: 159 checks pass
 clean under `-O2`, under `-fsanitize=address,undefined`, and under valgrind with
 no leaks in either direction. 400 additional randomised oracle round-trips and
 3100 fuzzed decoder inputs were run outside the suite without a failure.
@@ -94,22 +94,44 @@ CRC-32 and ISIZE both verified and both rejected on mismatch; `FEXTRA`,
 `FNAME`, `FCOMMENT` and `FHCRC` headers skipped; concatenated members handled,
 because `cat a.gz b.gz | gzip -d` handles them.
 
+The encoder emits all three block types and picks per block. Measured against
+`gzip -6` on this machine, before and after it learned to build its own trees:
+
+| input | bytes | fixed codes | own trees | `gzip -6` |
+| --- | --- | --- | --- | --- |
+| 20 copies of `inflate.c` | 513880 | 18098 (1.30x) | 14063 (1.01x) | 13880 |
+| 30000 repeated lines | 1320000 | 10984 (2.80x) | 4440 (1.13x) | 3916 |
+| 100KB of zeros | 100000 | 656 (4.97x) | 161 (1.22x) | 132 |
+| every byte value x400 | 102400 | 1235 (1.67x) | 805 (1.09x) | 739 |
+| the deep-tree fixture | 22958 | 22978 (1.40x) | 16378 (1.00x) | 16377 |
+| 10MB of docs and man pages | 10000000 | 7887682 (1.02x) | 7738648 (1.00x) | 7731463 |
+| 1.2MB of `/dev/urandom` | 1200000 | 1200203 | 1200203 | 1200203 |
+
+Encoding now costs 1.22x the time it did -- 330ms against 270ms on the 10MB
+corpus, where `gzip -6` takes 283ms. The trees themselves are close to free;
+the match search still dominates, which is why the two rows that are still
+furthest off are the two where the trees were never the problem.
+
 ### What does not work
 
-- **The encoder has no dynamic Huffman.** Fixed codes only, so output is about
-  1.35x larger than `gzip -6`: 12497 bytes vs 9342 on 348KB of C source, 6.70MB
-  vs 4.97MB on 10MB of hard-to-compress text. On *highly* repetitive input it is
-  worse -- 10984 bytes vs 3916, about 2.8x -- because fixed codes cannot cheapen
-  the handful of symbols such a file actually uses. This is the biggest thing
-  missing.
+- **Match finding is the remaining gap, not the coding.** One greedy pass,
+  first match wins, a fixed 128-entry chain limit, and a block boundary every
+  32KB regardless of where the symbol distribution actually turns over. That is
+  what the 1.13x on repetitive input and 1.22x on 100KB of zeros are made of:
+  the trees there are already as tight as trees can get.
+- **Over-long codes are corrected by halving frequencies, not by
+  package-merge.** A block whose natural Huffman tree runs deeper than the 15
+  bits RFC 1951 allows has every frequency halved and the tree rebuilt until it
+  fits. Correct, and coarse: one halving usually overshoots several levels at
+  once, so those blocks pay slightly more than an optimal length-limited code
+  would. Rare enough that no fixture reached it until one was built to.
 - **Nothing streams.** Both the whole input and the whole output are held in
   memory, and the encoder's match-chain array adds 4 bytes per input byte, so
   compressing an N-byte file costs roughly 5N plus the output. A file larger
   than RAM does not work at all. This is the limitation most likely to bite a
   real user first.
-- **Match finding is greedy with a fixed 128-entry chain limit.** No lazy
-  matching, no `-1`..`-9`. Those flags parse and are then ignored, which is a
-  small lie told for drop-in convenience.
+- **No `-1`..`-9`.** Those flags parse and are then ignored, which is a small
+  lie told for drop-in convenience.
 - **Slower than gzip**, by about 2.3x decoding and 1.4x encoding on 10MB of
   text. The decoder walks Huffman codes one bit at a time instead of using a
   lookup table.
@@ -141,7 +163,7 @@ Three decisions that look like shortcuts but are not:
 - Match copies go **one byte at a time**. `dist < length` is the run-length case
   DEFLATE leans on constantly; there `memcpy` and `memmove` are both wrong, so
   the optimisation would be a correctness bug.
-- The fixed distance tree is built with **32 codes, not 30**. RFC 1951 §3.2.6
+- The fixed distance tree is built with **32 codes, not 30**. RFC 1951 section 3.2.6
   defines the unusable 30 and 31 precisely so the tree comes out complete.
   Symbols 30 and 31 are then rejected at use.
 
@@ -150,7 +172,8 @@ naming its ceiling and upgrade path:
 
 | Where | Shortcut | Upgrade when |
 | --- | --- | --- |
-| `fixbits`/`wfix` | Fixed Huffman only in the encoder | ratio matters |
+| `huf1` | O(n^2) scan for the two lightest nodes, no heap | blocks grow by orders of magnitude |
+| `huflen` | Over-long codes halved into range, not package-merged | that fraction of a percent becomes measurable |
 | `prev[]` in `deflate_gz` | One chain slot per input byte, 4N memory | a file stops fitting in RAM |
 | `CHAIN` | One hard-coded chain limit, greedy matching | ratio matters |
 | `main` | `-1`..`-9` parse and do nothing | there is more than one strategy |
@@ -158,13 +181,21 @@ naming its ceiling and upgrade path:
 | `t/run.sh` | Scratch dir keyed on binary name only | two runs of the *same* binary ever race |
 
 The one piece of compression intelligence that is *not* optional is the
-per-block choice between a fixed-Huffman block and a stored block, because
-without it random input grows ~5% instead of ~0.02%. Each 32KB of input is
-tokenised, the fixed-Huffman cost is totted up as tokens are produced, and the
-cheaper block type wins. 32KB specifically because one stored block holds 65535
-bytes, so the chooser can never want a size it cannot express. On `/dev/urandom`
-this lands on byte-identical output to `gzip -9` -- 300068 bytes from 300000 --
-because both fall back to stored blocks with the same 5-byte overhead.
+per-block choice of block type, because without it random input grows ~5%
+instead of ~0.02%. Each 32KB of input is tokenised once, and then all three
+candidate costs are counted in bits before anything is written: stored, fixed
+codes, and dynamic codes *including* the tree header that block would have to
+carry. Cheapest wins, and dynamic has to win strictly, so a block with a flat
+distribution never pays for a tree it cannot earn back. 32KB specifically
+because one stored block holds 65535 bytes, so the chooser can never want a
+size it cannot express.
+
+On `/dev/urandom` that lands on exactly `gzip -9`'s size -- 1200203 bytes from
+1200000 -- because both fall back to stored blocks and pay the same 5 bytes per
+block. Not the same *bytes*, though, which is what this README claimed until
+the claim was checked: `gzip` writes a real `MTIME` where we write 0, and it
+flushes its stored blocks at 32777 bytes rather than 32768, so the two agree on
+the total and on nothing else.
 
 ## Where the tests are still weak
 
@@ -180,6 +211,22 @@ and pretending otherwise would be worse than saying so:
   allocated in 64KB steps and the bogus read lands inside that slack.
 - **`i == 0` before a repeat-previous code.** Deleting it reads `lens[-1]`, one
   byte before a stack array, and ASan's stack redzones did not flag it at `-O1`.
+
+Two more, found while adding the encoder's own Huffman trees:
+
+- **The deep-tree fixture can rot without failing.** `t/run.sh` builds it from
+  a seeded `random.Random(1)`, and its job is to make the natural tree 17 bits
+  deep so the 15-bit limiter has to run. Nothing in the suite checks that it
+  still does. If a future change to the matcher -- or to CPython's
+  `random.choices` -- flattens that distribution below 16 bits, the fixture
+  keeps passing while silently testing nothing. The two bits of headroom are
+  deliberate, and are not a substitute for the assertion.
+- **`cnt[0] = 0` in `hufcode` cannot be killed, and should not be chased.**
+  Deleting it leaves the suite green, which looks exactly like a coverage gap
+  and is not one: without it every `next[l]` comes out as the correct code plus
+  `2^l * cnt[0]`, and `wcode` only ever extracts the low `l` bits, so the
+  offset always masks off. It is kept because `code[]` holding real canonical
+  codes is worth one line to anyone who reads it later without knowing that.
 
 The honest summary is that the suite proves interoperability thoroughly and
 memory safety only partly.
@@ -200,6 +247,19 @@ I expected the 300-stream mutation fuzz to catch any missing bounds check,
 because an out-of-bounds back-reference is *the* classic inflate bug. It did
 not: deleting `dist > o->n` left all 137 assertions green. That is why there is
 now a section of hand-built streams that each violate exactly one rule.
+
+Then the same shape of mistake again, on the encoder this time. Dynamic
+Huffman went in, all 148 checks passed, and the ratio on the project's own
+source went from 1.30x to 1.01x -- so the obvious conclusion was that the
+existing fixtures covered the new code. They did not cover the part most likely
+to be wrong. Raising the 15-bit code-length cap to 16 left the suite green;
+deleting the length limiter outright *also* left the suite green, because not
+one of the eleven fixtures produced a Huffman tree deeper than 14 bits, and the
+limiter had therefore never executed in any test run. The fixture that forces it
+had to be constructed: Fibonacci frequencies, which are the deepest tree a given
+total can produce, laid out so that every three-byte window in the file is
+unique and LZ77 finds no match at all to blur them. With it in place, deleting
+the limiter fails against `gzip -d`, as it always should have.
 
 Worst of the three: the hand-built streams did not catch it either, and the
 reason was in the Makefile rather than the test. A sanitizer abort exits 1 by

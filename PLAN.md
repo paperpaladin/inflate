@@ -45,7 +45,8 @@ Ranked by how little control I have over them, most independent first:
 - Beating gzip on ratio or speed. Being *accepted by* gzip is the goal.
 - File arguments, `-k`, `-f`, timestamp or filename preservation, `-1`..`-9`
   actually selecting anything.
-- Dynamic Huffman in the *encoder* (the decoder needs it and has it).
+- Optimal length-limited Huffman (package-merge). Over-long codes are brought
+  into range by halving frequencies, which is correct but not optimal.
 - Threads, SIMD, or any platform beyond x86-64 Linux.
 
 ## Commit sequence
@@ -104,13 +105,20 @@ Ranked by how little control I have over them, most independent first:
 
 ### Milestone 1 - make the encoder competitive
 
-- [ ] 19 dynamic Huffman in the encoder
+- [x] 19 dynamic Huffman in the encoder
       why: the single largest gap. Fixed codes cost ~1.35x gzip -6 on text and
       ~2.8x on highly repetitive input, and no amount of better matching fixes
       that; the symbol frequencies have to reach the tree.
+      done: 1.30x -> 1.01x on text, 2.80x -> 1.13x on repetitive input. Found
+      that no fixture reached a tree deeper than 14 bits, so deleting the
+      15-bit limiter left the suite green; the fixture that forces it is now
+      in t/run.sh. Also found the README claiming byte-identical output to
+      gzip -9 on random input, which was only ever identical in size.
 - [ ] 20 lazy match evaluation
       why: greedy matching takes the first long match even when starting one
-      byte later would be longer. Classic ~3-5% for about fifteen lines.
+      byte later would be longer. Classic ~3-5% for about fifteen lines, and
+      with the trees now fitted per block the match search is what the whole
+      remaining gap is made of: 1.13x on repetitive input, 1.22x on zeros.
 - [ ] 21 wire `-1`..`-9` to CHAIN and the lazy threshold
       why: those flags currently parse and lie. Either make them mean
       something or remove them.
@@ -144,7 +152,11 @@ Ranked by how little control I have over them, most independent first:
       currently tell a good diagnosis from a vague one.
 - [ ] 28 run the mutation sweep from `make`
       why: it found three real problems and currently lives in my shell
-      history, which means it will rot.
+      history, which means it will rot. Raised in priority by item 19: the
+      deep-tree fixture exists only to drive the length limiter, and nothing
+      asserts it still does, so if that distribution ever flattens the suite
+      goes on passing while testing nothing. A sweep from `make` is what
+      notices.
 
 ### Milestone 4 - formats the shortcut corners rule out today
 

@@ -42,11 +42,30 @@ done > "$F/text"
 cat "$F/text" "$F/rand" "$F/text" > "$F/mixed"
 # Every byte value, so no literal symbol goes untested.
 python3 -c 'import sys;sys.stdout.buffer.write(bytes(range(256))*400)' > "$F/bytes"
+# A tree deeper than RFC 1951 allows. Frequencies on a Fibonacci chain are the
+# deepest tree a given total can produce, and every trigram here is unique, so
+# LZ77 finds no match at all and those frequencies reach the tree exactly as
+# built: 17 bits natural, against a 15-bit ceiling. Without this fixture the
+# encoder's length-limiting loop is dead code in every run -- raising its cap to
+# 16 left the whole suite green, which is how this got noticed.
+python3 > "$F/deep" <<'PY'
+import random, sys
+cnt, a, b = {}, 1, 1
+for i in range(22): cnt[i] = a; a, b = b, a + b
+for i in range(22, 96): cnt[i] = 200   # pad the alphabet, not the skew
+rnd, out, seen = random.Random(1), bytearray(b'\0\0'), set()
+while any(cnt.values()):
+    c = [s for s in cnt if cnt[s] and (out[-2], out[-1], s) not in seen]
+    if not c: break
+    s = rnd.choices(c, [cnt[k] for k in c])[0]
+    seen.add((out[-2], out[-1], s)); out.append(s); cnt[s] -= 1
+sys.stdout.buffer.write(bytes(out[2:]))
+PY
 # Long-distance matches: identical halves 500KB apart (beyond the 32K window
 # for the second copy's start, so it exercises the window limit too).
 cat "$F/text" > "$F/far"; head -c 20 /dev/zero >> "$F/far"; cat "$F/text" >> "$F/far"
 
-FIX="empty one two allsame zeros rep rand text mixed bytes far"
+FIX="empty one two allsame zeros rep rand text mixed bytes far deep"
 
 # ------------------------------------------- 1. gzip -d accepts our output
 for f in $FIX; do
@@ -319,12 +338,30 @@ done
 check "300 mutated streams: no crash (saw $crashes)" $([ $crashes -eq 0 ]; echo $?)
 
 # ------------------------------------------------------- 8. ratio sanity
-# Not a correctness property, but a silent regression to "store everything"
-# would still pass every test above, and that is worth catching.
-ours=$("$IN" < "$F/text" | wc -c)
-theirs=$(gzip -6 -c < "$F/text" | wc -c)
-if [ "$ours" -lt $((theirs * 2)) ]; then ok
-else bad "ratio: ours $ours vs gzip -6 $theirs on text (want < 2x)"; fi
+# Not a correctness property, but a silent regression to "store everything" or
+# to fixed-Huffman-only would still pass every test above, and that is worth
+# catching.
+#
+# BTYPE lives in bits 1-2 of the first byte after the 10-byte gzip header, LSB
+# first, so 10b (= 2) is a dynamic block. Asserting the structure rather than
+# only the size is what makes this independent of which gzip is installed.
+"$IN" < "$F/text" > "$D/r.gz"
+btype=$(python3 -c 'import sys;print((open(sys.argv[1],"rb").read(11)[10] >> 1) & 3)' "$D/r.gz")
+if [ "$btype" = 2 ]; then ok
+else bad "block chooser: first block of text is BTYPE $btype, want 2 (dynamic)"; fi
+
+# These two bounds are deliberately unreachable with fixed codes, which cost
+# 1.35x on text and 2.80x on the repetitive fixture. A bound of 2x -- what this
+# was before dynamic trees existed -- passed either way and so proved nothing.
+# The slack above the measured 1.05x and 1.13x is for a future gzip that packs
+# a little tighter than this one, not for us to regress into.
+for pair in "text 120" "rep 140"; do
+	set -- $pair
+	ours=$("$IN" < "$F/$1" | wc -c)
+	theirs=$(gzip -6 -c < "$F/$1" | wc -c)
+	if [ "$((ours * 100))" -lt "$((theirs * $2))" ]; then ok
+	else bad "ratio: ours $ours vs gzip -6 $theirs on $1 (want < $2% of it)"; fi
+done
 raw=$(wc -c < "$F/rand")
 ours=$("$IN" < "$F/rand" | wc -c)
 # Random data must go through stored blocks: at most 0.2% overhead.
