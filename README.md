@@ -84,7 +84,7 @@ hand and asserts that gzip and this code agree member by member.
 
 ## Status
 
-Works, and is verified to work by something other than itself: 159 checks pass
+Works, and is verified to work by something other than itself: 162 checks pass
 clean under `-O2`, under `-fsanitize=address,undefined`, and under valgrind with
 no leaks in either direction. 400 additional randomised oracle round-trips and
 3100 fuzzed decoder inputs were run outside the suite without a failure.
@@ -95,16 +95,21 @@ CRC-32 and ISIZE both verified and both rejected on mismatch; `FEXTRA`,
 because `cat a.gz b.gz | gzip -d` handles them.
 
 The encoder emits all three block types and picks per block. Measured against
-`gzip -6` on this machine, before and after it learned to build its own trees:
+`gzip -6` on this machine, before and after it learned to build its own trees.
+Five of these seven rows reproduce byte for byte today; the two that do not
+are marked, and why is worth saying. The `fixed codes` column is a
+measurement of an encoder that no longer exists, so a row cannot simply be
+re-run to refresh it -- both columns have to come from the same input, which
+is what dates the first row rather than making it wrong:
 
 | input | bytes | fixed codes | own trees | `gzip -6` |
 | --- | --- | --- | --- | --- |
-| 20 copies of `inflate.c` | 513880 | 18098 (1.30x) | **13508** (0.97x) | 13880 |
-| 30000 repeated lines | 1320000 | 10984 (2.80x) | 4440 (1.13x) | 3916 |
+| 20 copies of `inflate.c` *(when it was 25694 bytes; it is 28350 now, so this row no longer re-runs -- 567000 in gives 15038 against gzip's 15431)* | 513880 | 18098 (1.30x) | **13508** (0.97x) | 13880 |
+| 30000 repeated lines *(`the quick brown fox jumps over the lazy dog`, 44 bytes with its newline)* | 1320000 | 10984 (2.80x) | 4440 (1.13x) | 3916 |
 | 100KB of zeros | 100000 | 656 (4.97x) | 161 (1.22x) | 132 |
 | every byte value x400 | 102400 | 1235 (1.67x) | 805 (1.09x) | 739 |
 | the deep-tree fixture | 22958 | 22978 (1.40x) | 16378 (1.00x) | 16377 |
-| 10MB of docs and man pages | 10000000 | 7887682 (1.02x) | **7715731** (1.00x) | 7731463 |
+| 10MB of docs and man pages *(a local corpus, so not reproducible elsewhere)* | 10000000 | 7887682 (1.02x) | **7715731** (1.00x) | 7731463 |
 | 1.2MB of `/dev/urandom` | 1200000 | 1200203 | 1200203 | 1200203 |
 
 The "own trees" column also carries lazy matching, which is the other half of
