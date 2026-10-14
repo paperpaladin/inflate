@@ -28,7 +28,7 @@ Ranked by how little control I have over them, most independent first:
    directions are checked against it. This is the only judge whose agreement
    means anything, and where it disagrees with me, I am wrong.
 2. The RFCs themselves: 1951 and 1952. Authoritative but inert: they cannot
-   tell me I misread them, which is exactly the failure that matters.
+   tell me I misread them, exactly the failure that matters.
 3. AddressSanitizer / UBSan / valgrind: independent of my intent but not of
    my test inputs; they only see the paths something else drove them down.
 4. Mutation testing: delete one defensive check, confirm the suite goes
@@ -98,7 +98,7 @@ Ranked by how little control I have over them, most independent first:
       why: every rejected stream leaked 192KB, and LeakSanitizer had been
       reporting it unseen for the entire project.
 - [x] 17 fix: a sanitizer abort must not look like a clean rejection
-      why: ASan exits 1, which is exactly what the reject tests assert, so
+      why: ASan exits 1, exactly what the reject tests assert, so
       test-asan could not fail. It silently had not been failing.
 - [x] 18 docs: README, PLAN, LICENSE
       why: last, so they describe what was built, not what was hoped.
@@ -143,7 +143,7 @@ Ranked by how little control I have over them, most independent first:
       The strict comparison is the one that matters. While the flags were
       ignored every level produced identical output, and identical output is
       non-increasing, so a monotonicity check on its own would have been
-      green for a program where the flags did nothing, which is exactly the
+      green for a program where the flags did nothing, exactly the
       state this item existed to fix. Reverting the wiring now fails that one
       assertion by name.
 - [ ] 22 choose block boundaries by cost, not at a fixed 32KB
@@ -189,4 +189,4 @@ Ranked by how little control I have over them, most independent first:
       PNG and git packfiles need exactly that.
 - [ ] 30 verify FHCRC instead of skipping it
       why: a corrupt header is currently caught only after inflating the whole
-      payload, which is the wrong order for a hostile input.
+      payload, the wrong order for a hostile input.
