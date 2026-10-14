@@ -97,8 +97,7 @@ because `cat a.gz b.gz | gzip -d` handles them.
 The encoder emits all three block types and picks per block. Measured against
 `gzip -6` on this machine, before and after it learned to build its own trees.
 Five of these seven rows reproduce byte for byte today. The two that do not
-are marked, and why is worth saying. The `fixed codes` column is a
-measurement of an encoder that no longer exists, so a row cannot simply be
+are marked, and why is worth saying. That `fixed codes` column is a measurement of an encoder that no longer exists, so a row cannot simply be
 re-run to refresh it, both columns have to come from the same input, which
 is what dates the first row instead of making it wrong:
 
@@ -275,11 +274,11 @@ Three hand-written expectations turned out wrong, and in all three cases the
 code or the tool was right.
 
 The fixed distance tree with 30 codes "obviously" matched the 30 usable distance
-codes. The RFC spells out 32, and building it with 30 leaves the tree
+codes. That RFC spells out 32, and building it with 30 leaves the tree
 incomplete. Having fixed it, I then tried to write a test that distinguishes the
 two, and could not: valid streams never use codes 30 or 31, and both versions
 reject invalid ones, so the two are observationally equivalent and the oracle has
-no opinion. The 32-code form is still correct. The test I wanted does not exist.
+no opinion. The 32-code form is still correct. What I wanted to write does not exist.
 
 I expected the 300-stream mutation fuzz to catch any missing bounds check,
 because an out-of-bounds back-reference is *the* classic inflate bug. It did
