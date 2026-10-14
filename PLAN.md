@@ -15,7 +15,7 @@ at every level, byte for byte.**
 
 Nothing else in this project is worth anything if that is false. Ratio is a
 preference; speed is a preference; interoperability is the product. A violation
-is a failed project instead of something to triage. Secondary but non-negotiable: no
+is a failed project instead of something to triage. Secondary but non-negotiable. No
 input, however malformed, may make the decoder read or write out of bounds:
 `exit 1` with a message is the only acceptable response to garbage.
 

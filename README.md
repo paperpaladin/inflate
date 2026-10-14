@@ -131,7 +131,7 @@ that found a match. Wiring `-1`..`-9` to turn it off is the next item in
 - Match finding is still where the gap is. One lazy pass with a one-byte
   lookahead, a fixed 128-entry chain limit, and a block boundary every 32KB
   regardless of where the symbol distribution actually turns over. That is what
-  the 1.13x on repetitive input and 1.22x on 100KB of zeros are made of: the
+  the 1.13x on repetitive input and 1.22x on 100KB of zeros are made of. The
   trees there are already as tight as trees can get, and lazy matching cannot
   help, because every match in those already runs to the 258-byte cap.
 - Over-long codes are corrected by halving frequencies, not by
@@ -283,7 +283,7 @@ no opinion. The 32-code form is still correct. The test I wanted does not exist.
 
 I expected the 300-stream mutation fuzz to catch any missing bounds check,
 because an out-of-bounds back-reference is *the* classic inflate bug. It did
-not: deleting `dist > o->n` left all 137 assertions green. That is why there is
+not. Deleting `dist > o->n` left all 137 assertions green. That is why there is
 now a section of hand-built streams that each violate exactly one rule.
 
 Then the same shape of mistake again, on the encoder this time. Dynamic
