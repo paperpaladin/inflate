@@ -157,11 +157,9 @@ that found a match. Wiring `-1`..`-9` to turn it off is the next item in
 - Slower than gzip, by about 2.3x decoding and 1.4x encoding on 10MB of
   text. The decoder walks Huffman codes one bit at a time instead of using a
   lookup table.
-- `FHCRC` is skipped, not verified. A corrupt header is caught later by the
-  payload CRC-32, not up front.
+- `FHCRC` is skipped, not verified. A corrupt header is caught later by the payload CRC-32 instead of up front.
 - Incomplete Huffman trees are tolerated, not rejected. An under-subscribed
-  tree builds, and an unused bit pattern fails at use time, not at build
-  time. zlib is stricter about the literal/length tree specifically. No gzip
+  tree builds, and an unused bit pattern fails at use time instead of build time. zlib is stricter about the literal/length tree specifically. No gzip
   output exercises the difference, so the oracle cannot tell me which of us is
   right, and I would rather say so than guess.
 - No raw-DEFLATE or zlib (RFC 1950) mode, no file arguments, no `-k`/`-f`,
