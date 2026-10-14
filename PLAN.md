@@ -15,26 +15,26 @@ at every level, byte for byte.**
 
 Nothing else in this project is worth anything if that is false. Ratio is a
 preference; speed is a preference; interoperability is the product. A violation
-is not a bug to triage, it is a failed project. Secondary but non-negotiable: no
-input, however malformed, may make the decoder read or write out of bounds --
+is a failed project instead of something to triage. Secondary but non-negotiable: no
+input, however malformed, may make the decoder read or write out of bounds:
 `exit 1` with a message is the only acceptable response to garbage.
 
 ## Oracle
 
 Ranked by how little control I have over them, most independent first:
 
-1. **`/usr/bin/gzip`** -- a GPL implementation written by other people against
+1. `/usr/bin/gzip`: a GPL implementation written by other people against
    the same RFCs, with no shared code and no shared assumptions. Both
    directions are checked against it. This is the only judge whose agreement
    means anything, and where it disagrees with me, I am wrong.
-2. **The RFCs themselves** -- 1951 and 1952. Authoritative but inert: they cannot
+2. The RFCs themselves: 1951 and 1952. Authoritative but inert: they cannot
    tell me I misread them, which is exactly the failure that matters.
-3. **AddressSanitizer / UBSan / valgrind** -- independent of my intent but not of
+3. AddressSanitizer / UBSan / valgrind: independent of my intent but not of
    my test inputs; they only see the paths something else drove them down.
-4. **Mutation testing** -- delete one defensive check, confirm the suite goes
-   red. Judges the tests rather than the code, and catches the suite agreeing
+4. Mutation testing: delete one defensive check, confirm the suite goes
+   red. Judges the tests, not the code, and catches the suite agreeing
    with itself.
-5. **Our own round trip** -- weakest, and listed only for completeness. Both
+5. Our own round trip: weakest, and listed only for completeness. Both
    sides are mine, so a shared misunderstanding passes silently. It exists to
    catch regressions, never to establish correctness.
 
@@ -101,7 +101,7 @@ Ranked by how little control I have over them, most independent first:
       why: ASan exits 1, which is exactly what the reject tests assert, so
       test-asan could not fail. It silently had not been failing.
 - [x] 18 docs: README, PLAN, LICENSE
-      why: last, so they describe what was built rather than what was hoped.
+      why: last, so they describe what was built, not what was hoped.
 
 ### Milestone 1 - make the encoder competitive
 
@@ -119,15 +119,15 @@ Ranked by how little control I have over them, most independent first:
       byte later would be longer. Classic ~3-5% for about fifteen lines, and
       with the trees now fitted per block the match search is what the whole
       remaining gap is made of: 1.13x on repetitive input, 1.22x on zeros.
-      done: 3.9% on text, which takes it from 1.013x of gzip -6 to 0.973x --
+      done: 3.9% on text, which takes it from 1.013x of gzip -6 to 0.973x,
       smaller than gzip's own output. 0.3% on the 10MB corpus, and nothing at
       all on the repetitive, zeros and every-byte fixtures, whose matches all
       run to the 258-byte cap so there is no longer match to look for. Costs
       1.18x the encode time, because the match search now runs twice at every
       position that found one. The ratio bound on text went from 120% to 100%,
       which is the only value that separates lazy from greedy; one mutant
-      survives (>= instead of >) and is documented in the README rather than
-      chased with a brittle bound.
+      survives (>= instead of >) and is documented in the README,
+      not chased with a brittle bound.
 - [x] 21 wire `-1`..`-9` to CHAIN and the lazy threshold
       why: those flags currently parse and lie. Either make them mean
       something or remove them. Raised in value by item 20: lazy matching
@@ -142,11 +142,11 @@ Ranked by how little control I have over them, most independent first:
       level equals -6.
       The strict comparison is the one that matters. While the flags were
       ignored every level produced identical output, and identical output is
-      non-increasing -- so a monotonicity check on its own would have been
+      non-increasing, so a monotonicity check on its own would have been
       green for a program where the flags did nothing, which is exactly the
       state this item existed to fix. Reverting the wiring now fails that one
       assertion by name.
-- [ ] 22 choose block boundaries by cost rather than at a fixed 32KB
+- [ ] 22 choose block boundaries by cost, not at a fixed 32KB
       why: with dynamic trees in place, a block should end where the symbol
       distribution changes, not on a round number.
 
