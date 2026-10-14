@@ -42,8 +42,8 @@ closes that gap by writing both halves against the RFCs and then refusing to
 believe any of it until an independent implementation agrees.
 
 The decoder is the interesting half, and not because it is clever. It is a
-parser for bytes chosen by somebody else, which is the shape of problem that
-produces CVEs: a Huffman tree whose code lengths over-subscribe, a
+parser for bytes chosen by somebody else, the shape of problem that produces
+CVEs: a Huffman tree whose code lengths over-subscribe, a
 back-reference pointing before the start of output, a code-length repeat that
 runs off the end of the alphabet, a stored block claiming more bytes than
 remain. Each of those is a one-line check, and each of those checks is a
@@ -54,8 +54,8 @@ one-line vulnerability if you skip it.
 **`/usr/bin/gzip` is the authority. If it disagrees with this code, this code
 is wrong.** There is not a single hand-written expected bitstream in the test
 suite, on purpose: a suite written against my own reading of RFC 1951 would
-pass exactly when my misreadings were self-consistent, which is the failure
-mode that matters. Every assertion is a question put to an implementation I did
+pass exactly when my misreadings were self-consistent, the failure mode that
+matters. Every assertion is a question put to an implementation I did
 not write, ranked here by how little control I have over it:
 
 1. `./inflate < X | gzip -d` must reproduce `X`, byte for byte.
@@ -112,8 +112,8 @@ is what dates the first row instead of making it wrong:
 | 10MB of docs and man pages *(a local corpus, so not reproducible elsewhere)* | 10000000 | 7887682 (1.02x) | **7715731** (1.00x) | 7731463 |
 | 1.2MB of `/dev/urandom` | 1200000 | 1200203 | 1200203 | 1200203 |
 
-The "own trees" column also carries lazy matching, which is the other half of
-the gap and is what takes the first two rows below `gzip -6`. A greedy matcher
+The "own trees" column also carries lazy matching, the other half of the gap,
+and it is what takes the first two rows below `gzip -6`. A greedy matcher
 takes the match in front of it; this one checks whether starting one byte later
 is strictly longer and spends the byte as a literal when it is. Worth 3.9% on
 text: 14063 to 13508, and 0.3% on the 10MB corpus, and worth exactly
@@ -215,7 +215,7 @@ size it cannot express.
 
 On `/dev/urandom` that lands on exactly `gzip -9`'s size: 1200203 bytes from
 1200000, because both fall back to stored blocks and pay the same 5 bytes per
-block. Not the same *bytes*, though, which is what this README claimed until
+block. Not the same *bytes*, though, and this README claimed otherwise until
 the claim was checked: `gzip` writes a real `MTIME` where we write 0, and it
 flushes its stored blocks at 32777 bytes, not 32768, so the two agree on
 the total and on nothing else.
@@ -251,7 +251,7 @@ Two more, found while adding the encoder's own Huffman trees:
   offset always masks off. It is kept because `code[]` holding real canonical
   codes is worth one line to anyone who reads it later without knowing that.
 
-And one from the lazy matcher, which is the same shape as the 32-code case
+And one from the lazy matcher, the same shape as the 32-code case
 below: a real difference the oracle cannot resolve.
 
 - Changing the lazy test from `next > best` to `next >= best` survives.
