@@ -146,9 +146,46 @@ Ranked by how little control I have over them, most independent first:
       green for a program where the flags did nothing, exactly the
       state this item existed to fix. Reverting the wiring now fails that one
       assertion by name.
-- [ ] 22 choose block boundaries by cost, not at a fixed 32KB
+- [x] 22 choose block boundaries by cost, not at a fixed 32KB
       why: with dynamic trees in place, a block should end where the symbol
       distribution changes, not on a round number.
+      done: tokens accumulate in chunks of 4096 tokens or 8192 input bytes,
+      and a chunk starts a new block when pricing it separately beats folding
+      it into the block in progress. On the suite's own fixtures: 20 copies of
+      inflate.c 214648 -> 213172 against gzip -6's 217870, the same file twice
+      659KB apart 427763 -> 424737 against 434443, 30000 repeated lines
+      4440 -> 3915 against 3916, 100KB of zeros 161 -> 132 against 132, 70000
+      A's 129 -> 104 against 104, every byte value x400 805 -> 743 against 739,
+      text/random/text 1630731 -> 1627075 against 1640550, 1.2MB of urandom
+      1200203 -> 1200118 against 1200203. A 7.3MB tar of /usr/include goes
+      1631836 -> 1626345 against 1632111, and 400 files from /usr/include,
+      /usr/share/doc and /usr/bin go 24095673 -> 24005928 against 24144768.
+      Ten of those 400 came out BIGGER, by 1 to 58 bytes, worst 0.44% on a
+      13KB HTML file: the search is greedy one chunk deep. A margin requiring
+      the cut to clear a threshold was measured and made every corpus worse.
+      Encoding is 4% slower.
+      Two things the tokens-only version got wrong, both measured rather than
+      reasoned: a chunk bounded by token count alone covers half a megabyte
+      when matches are long, which put boundaries nowhere near the change of
+      distribution and cost 3.5% on repetitive text, and a block that can now
+      outgrow 65535 bytes has to split its stored form, which the LEN field
+      cannot express otherwise.
+      The suite grew a DEFLATE block walker (7 assertions) that measures the
+      shape of our own output: it has to reproduce the input from the blocks
+      it claims to find before any of its numbers count. The previous encoder
+      fails 5 of the suite's assertions, among them a block spanning more than
+      65536 bytes and a cut within 8192 bytes of each distribution change, at
+      offsets deliberately placed as far from a 32768-byte grid as possible.
+      Found that "sizes never grow as the level rises" was false before this
+      change and is more false after it: 6 of 480 level pairs over 60 real
+      files grow, worst 0.18%, against 2 of 480 at 0.029% before. It had
+      passed only because the one fixture it runs on is 20 copies of
+      inflate.c and happened not to be such a case; editing a comment in this
+      file broke it. The bound is 0.5% now.
+      Also found that the two dynamic-header terms in the cost model were
+      untestable from outside: deleting them changed no assertion. The encoder
+      now counts the bits it writes and dies if they differ from the price the
+      boundary search paid, which kills both.
 
 ### Milestone 2 - stop holding whole files in memory
 

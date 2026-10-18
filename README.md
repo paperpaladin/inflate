@@ -84,7 +84,7 @@ hand and asserts that gzip and this code agree member by member.
 
 ## Status
 
-Works, and is verified to work by something other than itself: 162 checks pass
+Works, and is verified to work by something other than itself: 169 checks pass
 clean under `-O2`, under `-fsanitize=address,undefined`, and under valgrind with
 no leaks in either direction. 400 additional randomised oracle round-trips and
 3100 fuzzed decoder inputs were run outside the suite without a failure.
@@ -122,17 +122,67 @@ nothing on the three degenerate rows, because their matches all run to the
 Encoding costs 1.50x the time it did before either change: 405ms against 270ms
 on the 10MB corpus, where `gzip -6` takes 281ms. The trees are close to free.
 Lazy matching is not, because it runs the match search twice at every position
-that found a match. Wiring `-1`..`-9` to turn it off is the next item in
-`PLAN.md`, and that measurement is why.
+that found a match. Wiring `-1`..`-9` to turn it off is why those flags exist.
+
+Blocks then stopped ending every 32768 input bytes and started ending where
+the symbol distribution changes. Tokens accumulate in chunks of 4096 tokens or
+8192 input bytes, whichever comes first, and each chunk is priced three ways:
+as its own block, as part of the block in progress, and the block in progress
+alone. When two blocks come out cheaper than one, the boundary goes there. On
+uniform input one header always beats two, so a block grows until the token
+buffer forces a boundary at a million tokens.
+
+Measured on the suite's own fixtures, which `t/run.sh` builds, against the
+same files before the change. The two text rows are 20 copies of `inflate.c`
+at 32973 bytes, so they move every time this file does:
+
+| fixture | bytes in | 32KB blocks | by cost | `gzip -6` |
+| --- | --- | --- | --- | --- |
+| 20 copies of `inflate.c` | 659460 | 214648 | **213172** | 217870 |
+| the same, twice, 659KB apart | 1318940 | 427763 | **424737** | 434443 |
+| 30000 repeated lines | 1320000 | 4440 | **3915** | 3916 |
+| 70000 `A`s | 70000 | 129 | **104** | 104 |
+| 100KB of zeros | 100000 | 161 | **132** | 132 |
+| every byte value x400 | 102400 | 805 | **743** | 739 |
+| text, random, text | 2518920 | 1630731 | **1627075** | 1640550 |
+| 1.2MB of `/dev/urandom` | 1200000 | 1200203 | **1200118** | 1200203 |
+| the deep-tree fixture | 22958 | 16378 | 16378 | 16377 |
+
+Two other corpora, local and so not reproducible elsewhere. A `tar` of
+`/usr/include/linux` and `/usr/include/x86_64-linux-gnu`, 7311360 bytes, goes
+from 1631836 to 1626345 against `gzip -6`'s 1632111. And 400 files sampled
+from `/usr/include`, `/usr/share/doc` and `/usr/bin`, 24095673 bytes of our
+output before and 24005928 after, against 24144768 for `gzip -6`.
+
+Ten of those 400 files came out **bigger**, by 1 to 58 bytes, the worst being
+0.44% on a 13KB HTML file. The boundary search is greedy: it decides a cut
+against the next chunk only, so a cut that pays for itself there can leave the
+chunks after it in the wrong block. A margin that required the cut to save
+more than it costs was tried and made every corpus worse, so it is not there.
+
+Encoding time went up 4%, 362ms to 376ms on the 7.3MB tar, where `gzip -6`
+takes 199ms. Pricing two or three candidate blocks per chunk means building
+Huffman trees for each of them, which is the cost.
 
 ### What does not work
 
-- Match finding is still where the gap is. One lazy pass with a one-byte
-  lookahead, a fixed 128-entry chain limit, and a block boundary every 32KB
-  regardless of where the symbol distribution actually turns over. That is what
-  the 1.13x on repetitive input and 1.22x on 100KB of zeros are made of. The
-  trees there are already as tight as trees can get, and lazy matching cannot
-  help, because every match in those already runs to the 258-byte cap.
+- Match finding is where the remaining gap is. One lazy pass with a one-byte
+  lookahead and a chain limit of 4 to 1024 depending on the level. The two
+  degenerate rows that used to sit at 1.13x and 1.22x of `gzip -6` are now
+  level with it, because those were block-boundary costs rather than matching
+  costs, but nothing here looks for a better match than the first long one it
+  finds a byte later.
+- The block boundary search is greedy and one chunk deep. It asks whether
+  this chunk belongs with the block in front of it, never whether the three
+  chunks after it would have changed the answer, and it cannot move a boundary
+  once it is placed. That is what makes 10 files in 400 come out a few bytes
+  larger than the fixed 32KB grid did. An optimal split is a shortest-path
+  problem over chunk boundaries, which is what zopfli does and what this does
+  not.
+- Blocks cannot grow past a million tokens. The buffer that holds them is
+  what forces a boundary, so a uniform file pays a tree header every million
+  tokens whether or not the distribution gave any reason for one. Streaming the
+  encoder is the item that has to revisit it.
 - Over-long codes are corrected by halving frequencies, not by
   package-merge. A block whose natural Huffman tree runs deeper than the 15
   bits RFC 1951 allows has every frequency halved and the tree rebuilt until it
@@ -154,6 +204,16 @@ that found a match. Wiring `-1`..`-9` to turn it off is the next item in
   monotonicity check alone would not have caught that, since every level
   produced identical output and identical output is non-increasing, so the
   suite asserts `-1` is *strictly* larger than `-9`.
+
+  They are also not monotone, which the suite claimed they were. A deeper
+  chain finds different matches, which changes where the cost puts a block
+  boundary, so a level can land a few bytes above the level below it. Over 60
+  real files, 6 of 480 level pairs grow, the worst by 0.18%; the encoder before
+  cost-chosen boundaries had 2 of 480 growing by up to 0.029%, so the strict
+  claim was already false when it was written. It survived because the only
+  fixture it runs on happened not to be one of those cases, and it failed the
+  first time that fixture changed by a few bytes, that fixture being 20 copies
+  of `inflate.c`. The assertion now allows 0.5%.
 - Slower than gzip, by about 2.3x decoding and 1.4x encoding on 10MB of
   text. The decoder walks Huffman codes one bit at a time instead of using a
   lookup table.
@@ -195,27 +255,43 @@ naming its ceiling and upgrade path:
 | `huf1` | O(n^2) scan for the two lightest nodes, no heap | blocks grow by orders of magnitude |
 | `huflen` | Over-long codes halved into range, not package-merged | that fraction of a percent becomes measurable |
 | `prev[]` in `deflate_gz` | One chain slot per input byte, 4N memory | a file stops fitting in RAM |
-| `CHAIN` | One hard-coded chain limit, greedy matching | ratio matters |
-| `main` | `-1`..`-9` parse and do nothing | there is more than one strategy |
+| `MAXTOK` | A block cannot outgrow the token buffer | the encoder streams |
 | `gunzip` | `FHCRC` skipped, not verified | a caller must reject bad headers before inflating |
 | `t/run.sh` | Scratch dir keyed on binary name only | two runs of the *same* binary ever race |
 
 The one piece of compression intelligence that is *not* optional is the
 per-block choice of block type, because without it random input grows ~5%
-instead of ~0.02%. Each 32KB of input is tokenised once, and then all three
-candidate costs are counted in bits before anything is written: stored, fixed
-codes, and dynamic codes *including* the tree header that block would have to
-carry. Cheapest wins, and dynamic has to win strictly, so a block with a flat
-distribution never pays for a tree it cannot earn back. 32KB specifically
-because one stored block holds 65535 bytes, so the chooser can never want a
-size it cannot express.
+instead of ~0.02%. All three candidate costs are counted in bits before
+anything is written: stored, fixed codes, and dynamic codes *including* the
+tree header that block would have to carry. Cheapest wins, and dynamic wins
+ties, so a block with a flat distribution never pays for a tree it cannot earn
+back.
 
-On `/dev/urandom` that lands on exactly `gzip -9`'s size: 1200203 bytes from
-1200000, because both fall back to stored blocks and pay the same 5 bytes per
-block. Not the same *bytes*, though, and this README claimed otherwise until
-the claim was checked: `gzip` writes a real `MTIME` where we write 0, and it
-flushes its stored blocks at 32777 bytes, not 32768, so the two agree on
-the total and on nothing else.
+The same cost function then chooses the boundaries, which is why it is
+computed from symbol counts rather than from the tokens. Merging a candidate
+chunk into the block in progress is 316 additions, so pricing a boundary does
+not mean walking a million tokens again.
+
+A block's cost has to be the number of bits the writer then emits, or every
+boundary in the file was chosen on a fiction, so the encoder checks: it counts
+the bits it wrote and dies if they differ from the price. That check is the
+only thing standing behind the two dynamic-header terms. Dropping the `3 *
+hclen` term, or the extra bits on code-length symbol 16, leaves every other
+assertion in the suite green, and both are caught the moment the writer and
+the price disagree. Stored blocks are exempt: their byte alignment is a
+worst case, not a count.
+
+A stored block holds 65535 bytes, which a block could not reach while blocks
+were cut at 32768; a long stored run is now written in pieces, each with its
+own LEN/NLEN pair, and only the last of them carries `BFINAL`.
+
+On `/dev/urandom` this used to land on exactly `gzip -9`'s size: 1200203 bytes
+from 1200000, because both fell back to stored blocks and paid the same 5 bytes
+per block. It is 1200118 now, 85 bytes smaller, because a stored run is cut at
+65535 rather than 32768 and so pays that overhead half as often. The bytes were
+never the same anyway, and this README claimed otherwise until the claim was
+checked: `gzip` writes a real `MTIME` where we write 0, and it flushes its
+stored blocks at 32777 bytes, not 32768.
 
 ## Where the tests are still weak
 
@@ -262,6 +338,41 @@ below: a real difference the oracle cannot resolve.
   the text fixture is twenty copies of `inflate.c`, so it changes size every
   time this file does. Left as a known gap, not papered over with a
   brittle number.
+
+Seventeen mutations of the block-boundary code were planted and rebuilt.
+Thirteen are caught, four are not:
+
+- `stored_cost` returning `parts = 1` for a run of any length. It
+  underprices a long stored block by 42 bits per 65535 bytes, which is 0.008%
+  of what the block costs, and no decision this feeds turns on a margin that
+  thin. Equivalent in every measurable sense; killing it would mean asserting
+  on a cost the encoder never prints.
+- `CHUNKIN` raised from 8192 to a megabyte, which is the same as removing
+  it. This is a tuning constant: it costs 3.5% on 20 copies of a 28KB file,
+  where long matches make 4096 tokens cover half a megabyte, and it *gains*
+  0.02% on the suite's own fixtures. Pinning it would mean a size bound tight
+  enough to fail for the next matcher improvement, and a tuning constant is
+  exactly the thing a brittle bound should not be spent on.
+- Deleting the cost self-check. An assertion that never fires in a correct
+  program cannot be observed on its own, which makes this survivor expected
+  rather than informative. What it is worth was measured by planting it
+  *together* with a cost defect: with the check deleted, dropping the
+  `3 * hclen` term or the `clextra` term from the dynamic price leaves all
+  169 assertions green, and with it in place both die immediately. So the
+  check is load-bearing and the survivor is the hole it fills, not a hole
+  in it.
+- `fix < best` becoming `fix <= best` in the block-type chooser. It changes
+  which type wins when a fixed-code block and a dynamic one cost the same
+  number of bits, and a tie means the output is the same size either way. No
+  size assertion can see it and none should be written to.
+
+The thirteen that are caught are worth listing, because they are the shape of
+defect this item could plausibly have shipped: never cutting a block, always
+cutting one, cutting on a fixed grid (the previous encoder fails 5
+assertions), a stored run not split at 65535, `BFINAL` set on every piece of
+a split stored run, counting a match as one byte instead of its length, a
+million-token buffer shrunk to 16384, and six separate terms removed from the
+cost model.
 
 The honest summary is that the suite proves interoperability thoroughly and
 memory safety only partly.

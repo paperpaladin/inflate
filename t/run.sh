@@ -361,10 +361,13 @@ else bad "block chooser: first block of text is BTYPE $btype, want 2 (dynamic)";
 # this gzip's output and will need revisiting against one that packs tighter,
 # which is the price of a bound that can actually fail.
 #
-# rep at 140% is about the trees, not the matching: its matches all run to the
-# 258-byte cap, so lazy evaluation never triggers there and the measurement is
-# 1.13x either way.
-for pair in "text 100" "rep 140"; do
+# rep at 110% is about the trees and the block boundaries, not the matching:
+# its matches all run to the 258-byte cap, so lazy evaluation never triggers
+# there. It measured 1.13x of gzip -6 with blocks cut every 32768 input bytes
+# and 0.9997x with them cut by cost, so a fixed grid misses this bound by a
+# wide margin while the current encoder keeps 10% of slack against whichever
+# gzip is installed. Tightening it to the measurement would pin this gzip.
+for pair in "text 100" "rep 110"; do
 	set -- $pair
 	ours=$("$IN" < "$F/$1" | wc -c)
 	theirs=$(gzip -6 -c < "$F/$1" | wc -c)
@@ -387,14 +390,23 @@ for l in 1 2 3 4 5 6 7 8 9; do
 		lvlok=0
 	fi
 	n=$(wc -c < "$D/l$l.gz")
-	if [ "$prev" -ne 0 ] && [ "$n" -gt "$prev" ]; then
-		bad "level -$l grew to $n from $prev at the level below"
+	# Not "never grows", which was never true and is said so in the README.
+	# A deeper chain finds different matches, which moves where the cost puts
+	# a block boundary, and a level can land a few bytes above the one below
+	# it. Measured over 60 real files, 480 level pairs: 6 of them grow, the
+	# worst by 0.18%, and the encoder before cost-chosen boundaries had 2 of
+	# them growing by up to 0.029%. So the strict form was already false when
+	# it was written. It passed because the one fixture it runs on happened
+	# not to be one of those cases, and it failed the moment that fixture
+	# changed by a few bytes, this file being 20 copies of inflate.c.
+	if [ "$prev" -ne 0 ] && [ $((n * 200)) -gt $((prev * 201)) ]; then
+		bad "level -$l grew to $n from $prev at the level below (over 0.5%)"
 		lvlok=0
 	fi
 	prev=$n
 	eval "sz$l=$n"
 done
-[ "$lvlok" = 1 ] && ok "-1..-9 all round-trip through gzip -d, sizes never grow"
+[ "$lvlok" = 1 ] && ok "-1..-9 all round-trip through gzip -d, within 0.5% of monotone"
 
 if [ "$sz1" -gt "$sz9" ]; then
 	ok "-9 beats -1 on text ($sz9 vs $sz1 bytes)"
@@ -416,6 +428,154 @@ ours=$("$IN" < "$F/rand" | wc -c)
 # Random data must go through stored blocks: at most 0.2% overhead.
 if [ "$ours" -lt $((raw + raw / 500)) ]; then ok
 else bad "ratio: random data expanded $raw -> $ours (stored path not taken?)"; fi
+
+# ------------------------------------------- 9. cost-chosen block boundaries
+# Blocks used to end every 32768 input bytes. They now end where the symbol
+# distribution changes, which is invisible to every test above: all of them
+# pass for any boundary policy that produces a decodable stream.
+#
+# The fixture is text, then random, then the same text, so there are two sharp
+# changes at known offsets and a middle that cannot be compressed at all.
+#
+# The walker below is an instrument, not an oracle. gzip -d in section 1 is
+# what says the stream is correct; this only measures its shape, and it checks
+# itself by having to reproduce the input byte for byte from the blocks it
+# claims to have found. If the walker is wrong, `decoded` is 0 and every
+# number after it is worthless.
+head -c 212992 "$F/text" > "$D/tri"
+head -c 163840 "$F/rand" >> "$D/tri"
+head -c 212992 "$F/text" >> "$D/tri"
+
+decoded=0 nblocks=0 maxspan=0 cut1=999999 cut2=999999 midtype=9 maxstored=0
+eval "$(python3 - "$D/tri" "$IN" <<'PY'
+import subprocess, sys
+
+LB = [3,4,5,6,7,8,9,10,11,13,15,17,19,23,27,31,35,43,51,59,67,83,99,115,131,
+      163,195,227,258]
+LE = [0,0,0,0,0,0,0,0,1,1,1,1,2,2,2,2,3,3,3,3,4,4,4,4,5,5,5,5,0]
+DB = [1,2,3,4,5,7,9,13,17,25,33,49,65,97,129,193,257,385,513,769,1025,1537,
+      2049,3073,4097,6145,8193,12289,16385,24577]
+DE = [0,0,0,0,1,1,2,2,3,3,4,4,5,5,6,6,7,7,8,8,9,9,10,10,11,11,12,12,13,13]
+ORD = [16,17,18,0,8,7,9,6,10,5,11,4,12,3,13,2,14,1,15]
+
+class BR:
+	def __init__(s, b, p): s.b, s.pos = b, p * 8
+	def bit(s):
+		v = (s.b[s.pos >> 3] >> (s.pos & 7)) & 1; s.pos += 1; return v
+	def bits(s, n):
+		v = 0
+		for i in range(n): v |= s.bit() << i
+		return v
+	def align(s): s.pos = (s.pos + 7) & ~7
+
+def table(lens):            # canonical codes, RFC 1951 3.2.2
+	m, code = {}, 0
+	for l in range(1, 16):
+		for s, sl in enumerate(lens):
+			if sl == l: m[(l, code)] = s; code += 1
+		code <<= 1
+	return m
+
+def dec(br, m):
+	l = code = 0
+	while l < 15:
+		code = (code << 1) | br.bit(); l += 1
+		if (l, code) in m: return m[(l, code)]
+	raise ValueError('no code')
+
+def walk(gz):
+	br, out, blocks = BR(gz, 10), bytearray(), []
+	fixlit = [8]*144 + [9]*112 + [7]*24 + [8]*8
+	while True:
+		final, btype, start = br.bit(), br.bits(2), len(out)
+		if btype == 0:
+			br.align()
+			L, N = br.bits(16), br.bits(16)
+			if N != (~L & 0xffff): raise ValueError('NLEN')
+			for _ in range(L): out.append(br.bits(8))
+		else:
+			if btype == 1:
+				lt, dt = table(fixlit), table([5] * 30)
+			else:
+				hlit, hdist = br.bits(5) + 257, br.bits(5) + 1
+				hclen = br.bits(4) + 4
+				cl = [0] * 19
+				for i in range(hclen): cl[ORD[i]] = br.bits(3)
+				ct, lens = table(cl), []
+				while len(lens) < hlit + hdist:
+					s = dec(br, ct)
+					if s < 16:    lens.append(s)
+					elif s == 16: lens += [lens[-1]] * (br.bits(2) + 3)
+					elif s == 17: lens += [0] * (br.bits(3) + 3)
+					else:         lens += [0] * (br.bits(7) + 11)
+				lt, dt = table(lens[:hlit]), table(lens[hlit:])
+			while True:
+				s = dec(br, lt)
+				if s == 256: break
+				if s < 256:
+					out.append(s)
+				else:
+					n = LB[s - 257] + br.bits(LE[s - 257])
+					d = dec(br, dt)
+					d = DB[d] + br.bits(DE[d])
+					for _ in range(n): out.append(out[-d])
+		blocks.append((btype, len(out) - start))
+		if final: break
+	return blocks, bytes(out)
+
+data = open(sys.argv[1], 'rb').read()
+gz = subprocess.run([sys.argv[2]], input=data, capture_output=True,
+                    check=True).stdout
+try:
+	blocks, out = walk(gz)
+except Exception as e:
+	print('# walker failed: %s' % e)
+	sys.exit(0)
+
+ends, off, mid = [], 0, 9
+for t, nb in blocks:
+	if off <= 294912 < off + nb: mid = t
+	off += nb
+	ends.append(off)
+stored = [nb for t, nb in blocks if t == 0]
+print('decoded=%d' % (out == data))
+print('nblocks=%d' % len(blocks))
+print('maxspan=%d' % max(nb for _, nb in blocks))
+print('cut1=%d' % min(abs(e - 212992) for e in ends))
+print('cut2=%d' % min(abs(e - 376832) for e in ends))
+print('midtype=%d' % mid)
+print('maxstored=%d' % (max(stored) if stored else 0))
+PY
+)"
+
+check "block walker reproduces the input from the blocks it found" \
+	$([ "$decoded" = 1 ]; echo $?)
+# Several blocks, or every assertion below is about one block and the boundary
+# logic is never reached at all.
+check "block boundaries: 600KB of mixed input needs several blocks ($nblocks)" \
+	$([ "$nblocks" -ge 4 ]; echo $?)
+# The sharp one. A block covered at most 32768 input bytes plus one trailing
+# match until boundaries were chosen by cost, so twice that is a figure no
+# fixed 32KB grid can reach.
+check "block boundaries: one block spans more than 65536 bytes ($maxspan)" \
+	$([ "$maxspan" -gt 65536 ]; echo $?)
+# A boundary has to land near each change of distribution. A chunk covers at
+# most CHUNKIN = 8192 bytes, so the cut can be one chunk late and no later.
+#
+# The two changes sit at 212992 and 376832, both odd multiples of 16384 and so
+# as far from a 32768-byte grid as an offset can be. That is deliberate:
+# cutting every 32768 bytes puts the nearest boundary 16384 away and misses
+# both of these by a factor of two.
+check "block boundaries: cut within 8192 bytes of the text/random change ($cut1)" \
+	$([ "$cut1" -le 8192 ]; echo $?)
+check "block boundaries: cut within 8192 bytes of the random/text change ($cut2)" \
+	$([ "$cut2" -le 8192 ]; echo $?)
+check "block boundaries: the random run lands in a stored block (type $midtype)" \
+	$([ "$midtype" = 0 ]; echo $?)
+# A stored block's LEN is 16 bits, a limit no block could reach while they
+# were capped at 32768 bytes; a 200KB stored run now goes out in pieces.
+check "stored blocks are split at the 16-bit LEN limit ($maxstored)" \
+	$([ "$maxstored" = 65535 ]; echo $?)
 
 printf '\n%d passed, %d failed\n' "$pass" "$fail"
 [ "$fail" -eq 0 ]
