@@ -12,7 +12,7 @@ rm -rf t/tmp
 gcc -std=c11 -O2 -Wall -Wextra -Wpedantic -o inflate inflate.c
 t/run.sh ./inflate
 
-162 passed, 0 failed
+169 passed, 0 failed
 ```
 
 ```
@@ -22,7 +22,7 @@ gcc -std=c11 -g -O1 -fsanitize=address,undefined -fno-omit-frame-pointer \
 ASAN_OPTIONS=exitcode=86 \
 	 UBSAN_OPTIONS=halt_on_error=1:print_stacktrace=1:exitcode=86 t/run.sh ./inflate-asan
 
-162 passed, 0 failed
+169 passed, 0 failed
 ```
 
 Usage is stdin to stdout and nothing else:
